@@ -14,8 +14,6 @@ edim_out:
   value: 64
 batch_size:
   value: 16384
-nhops:
-  value: 1
 fanout:
   value: 32768
 agg_type:

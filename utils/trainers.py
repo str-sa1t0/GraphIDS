@@ -36,7 +36,10 @@ def train_encoder(
             batch = batch.to(device)
 
             train_emb = model.encoder(
-                batch.x, batch.edge_index, batch.edge_attr, batch.batch_edge_couples
+                batch.edge_index,
+                batch.edge_attr,
+                batch.batch_edge_couples,
+                batch.num_nodes,
             )
             ae_train_loader = DataLoader(
                 SequentialDataset(
@@ -168,7 +171,10 @@ def validate(model, val_loader, ae_batch_size, window_size, device):
             batch = batch.to(device)
 
             val_emb = model.encoder(
-                batch.x, batch.edge_index, batch.edge_attr, batch.batch_edge_couples
+                batch.edge_index,
+                batch.edge_attr,
+                batch.batch_edge_couples,
+                batch.num_nodes,
             )
             labels.append(batch.edge_label.cpu())
             ae_val_loader = DataLoader(
@@ -208,7 +214,10 @@ def test(model, test_loader, ae_batch_size, window_size, device, threshold):
             batch = batch.to(device)
 
             test_emb = model.encoder(
-                batch.x, batch.edge_index, batch.edge_attr, batch.batch_edge_couples
+                batch.edge_index,
+                batch.edge_attr,
+                batch.batch_edge_couples,
+                batch.num_nodes,
             )
             labels.append(batch.edge_label.cpu())
             ae_test_loader = DataLoader(

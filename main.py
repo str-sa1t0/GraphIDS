@@ -57,7 +57,6 @@ def main(run):
         dropout=config.dropout,
         ae_dropout=config.ae_dropout,
         positional_encoding=config.positional_encoding,
-        nhops=config.nhops,
         agg_type=config.agg_type,
         mask_ratio=config.mask_ratio,
     ).to(device)
@@ -94,9 +93,8 @@ def main(run):
         shuffle = True
     else:
         shuffle = False
-    fanout_list = (
-        [config.fanout] * config.nhops if config.fanout != -1 else [-1] * config.nhops
-    )
+    fanout_list = [config.fanout] if config.fanout != -1 else [-1]
+
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     recommended_workers = min(os.cpu_count(), 6)
@@ -235,7 +233,6 @@ if __name__ == "__main__":
             "ae_weight_decay": args.ae_weight_decay,
             "edim_out": args.edim_out,
             "batch_size": args.batch_size,
-            "nhops": args.nhops,
             "fanout": args.fanout,
             "agg_type": args.agg_type,
             "num_layers": args.num_layers,

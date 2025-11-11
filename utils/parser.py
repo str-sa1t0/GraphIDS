@@ -47,13 +47,6 @@ class Parser(argparse.ArgumentParser):
             help="The number of edges to be sampled for each node",
         )
         self.add_argument(
-            "--nhops",
-            "-k",
-            type=int,
-            default=1,
-            help="Number of hops for the GNN",
-        )
-        self.add_argument(
             "--edim_out",
             type=int,
             default=64,

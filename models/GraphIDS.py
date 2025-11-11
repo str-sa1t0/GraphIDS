@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import scatter
 
 
 class SAGELayer(MessagePassing):
@@ -19,91 +20,58 @@ class SAGELayer(MessagePassing):
         nn.init.xavier_normal_(self.fc_edge.weight, gain=gain)
 
     def message(self, edge_attr):
-        """Define how messages are computed from edge features"""
+        """
+        Copy edge features as messages.
+        DGL equivalent: fn.copy_e("h", "m")
+        """
         return edge_attr
 
-    def forward(self, x, edge_index, edge_attr, edge_couples):
+    def aggregate(self, inputs, index, ptr=None, dim_size=None):
         """
-        Args:
-            x: Node features [num_nodes, ndim_in]
-            edge_index: Edge connectivity [2, num_edges]
-            edge_attr: Edge features [num_edges, edim_in]
-            edge_couples: Target edge pairs [batch_size, 2]
+        Aggregate edge features to destination nodes using mean aggregation.
+        DGL equivalent: fn.mean("m", "h_neigh")
         """
-        node_embeddings = self.propagate(
-            edge_index, edge_attr=edge_attr, size=(x.shape[0], x.shape[0])
+        return scatter(
+            inputs, index, dim=self.node_dim, dim_size=dim_size, reduce="mean"
         )
+
+    def forward(self, edge_index, edge_attr, edge_couples, num_nodes):
+        """
+        Aggregate edge features to nodes, then compute edge embeddings.
+
+        Args:
+            edge_index: Edge connectivity [2, num_edges]
+            edge_attr: Edge features [num_edges, edim_in] - the actual input data
+            edge_couples: Target edge pairs [batch_size, 2] - edges to embed
+            num_nodes: Number of nodes in the graph
+
+        Returns:
+            edge_embeddings: [batch_size, edim_out] - final edge representations
+
+        Process:
+            1. Aggregate edge features to nodes (mean of incoming edges)
+            2. Transform aggregated features: fc_neigh + ReLU
+            3. For target edges: concat source & dest node embeddings
+            4. Project to final edge embeddings: fc_edge + dropout
+        """
+        # Aggregate edge features to nodes (DGL: fn.copy_e + fn.mean)
+        node_embeddings = self.propagate(
+            edge_index, edge_attr=edge_attr, size=(num_nodes, num_nodes)
+        )
+        # Transform aggregated features and activate
         node_embeddings = self.relu(self.fc_neigh(node_embeddings))
 
-        src_nodes = edge_couples[:, 0]
-        dst_nodes = edge_couples[:, 1]
-
+        # Compute edge embeddings from concatenated source and destination node embeddings
         edge_embeddings = self.fc_edge(
-            torch.cat([node_embeddings[src_nodes], node_embeddings[dst_nodes]], dim=1)
+            torch.cat(
+                [
+                    node_embeddings[edge_couples[:, 0]],
+                    node_embeddings[edge_couples[:, 1]],
+                ],
+                dim=1,
+            )
         )
-        edge_embeddings = self.dropout(edge_embeddings)
-        return node_embeddings, edge_embeddings
-
-
-class SAGE(nn.Module):
-    def __init__(
-        self, ndim_in, edim_in, edim_out, nhops, dropout_rate, agg_type="mean"
-    ):
-        super(SAGE, self).__init__()
-        self.layers = nn.ModuleList()
-
-        if nhops == 1:
-            self.layers.append(
-                SAGELayer(
-                    ndim_in,
-                    edim_in,
-                    edim_out,
-                    agg_type=agg_type,
-                    dropout_rate=dropout_rate,
-                )
-            )
-        else:
-            self.layers.append(
-                SAGELayer(
-                    ndim_in,
-                    edim_in,
-                    edim_in,
-                    agg_type=agg_type,
-                    dropout_rate=dropout_rate,
-                )
-            )
-            for _ in range(nhops - 2):
-                self.layers.append(
-                    SAGELayer(
-                        ndim_in,
-                        edim_in,
-                        edim_in,
-                        agg_type=agg_type,
-                        dropout_rate=dropout_rate,
-                    )
-                )
-            self.layers.append(
-                SAGELayer(
-                    ndim_in,
-                    edim_in,
-                    edim_out,
-                    agg_type=agg_type,
-                    dropout_rate=dropout_rate,
-                )
-            )
-
-    def forward(self, x, edge_index, edge_attr, edge_couples):
-        """
-        Args:
-            x: Node features [num_nodes, ndim_in]
-            edge_index: Edge connectivity [2, num_edges]
-            edge_attr: Edge features [num_edges, edim_in]
-            edge_couples: Target edge pairs [batch_size, 2]
-        """
-        for layer in self.layers:
-            x, edge_embeddings = layer(x, edge_index, edge_attr, edge_couples)
-
-        return edge_embeddings
+        return self.dropout(edge_embeddings)
 
 
 class LearnablePositionalEncoding(nn.Module):
@@ -242,14 +210,11 @@ class GraphIDS(nn.Module):
         dropout=0.0,
         ae_dropout=0.1,
         positional_encoding=None,
-        nhops=1,
         agg_type="mean",
         mask_ratio=0.15,
     ):
         super(GraphIDS, self).__init__()
-        self.encoder = SAGE(
-            ndim_in, edim_in, edim_out, nhops, dropout, agg_type=agg_type
-        )
+        self.encoder = SAGELayer(ndim_in, edim_in, edim_out, agg_type, dropout)
         self.transformer = TransformerAutoencoder(
             edim_out,
             embed_dim,
