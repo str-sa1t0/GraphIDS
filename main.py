@@ -62,13 +62,6 @@ def main(run):
         mask_ratio=config.mask_ratio,
     ).to(device)
 
-    if hasattr(torch, "compile"):
-        try:
-            model = torch.compile(model, mode="reduce-overhead")
-        except Exception as e:
-            print(f"Model compilation failed: {e}")
-            print("Continuing with eager execution")
-
     optimizer = torch.optim.AdamW(
         [
             {  # Higher weight decay for embedding layer
@@ -158,6 +151,7 @@ def main(run):
             persistent_workers=True,
             drop_last=False,
         )
+        print("Starting training...")
         model, threshold = train_encoder(
             model,
             config.window_size,
@@ -174,6 +168,7 @@ def main(run):
             checkpoint,
         )
 
+    print("Evaluating on test set...")
     test_f1, test_pr_auc, errors, test_labels, prediction_time = test(
         model,
         test_loader,
