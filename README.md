@@ -2,32 +2,41 @@
 
 # Self-Supervised Learning of Graph Representations for Network Intrusion Detection
 
-This repository provides the official code and pretrained models for our paper, accepted at NeurIPS 2025.
+This repository provides the official code for our NeurIPS 2025 paper.
 
-<details>
-<summary>Abstract</summary>
-Detecting intrusions in network traffic is a challenging task, particularly under limited supervision and constantly evolving attack patterns. While recent works have leveraged graph neural networks for network intrusion detection, they often decouple representation learning from anomaly detection, limiting the utility of the embeddings for identifying attacks. We propose GraphIDS, a self-supervised intrusion detection model that unifies these two stages by learning local graph representations of normal communication patterns through a masked autoencoder. An inductive graph neural network embeds each flow with its local topological context to capture typical network behavior, while a Transformer-based encoder-decoder reconstructs these embeddings, implicitly learning global co-occurrence patterns via self-attention without requiring explicit positional information. During inference, flows with unusually high reconstruction errors are flagged as potential intrusions. This end-to-end framework ensures that embeddings are directly optimized for the downstream task, facilitating the recognition of malicious traffic. On diverse NetFlow benchmarks, GraphIDS achieves up to 99.98% PR-AUC and 99.61% macro F1-score, outperforming baselines by 5-25 percentage points.
-</details>
+## Overview
+
+GraphIDS is a self-supervised intrusion detection system that learns graph representations of normal network traffic patterns. The model combines:
+- **E-GraphSAGE**: An inductive GNN that embeds each flow with its local topological context
+- **Masked Transformer Autoencoder**: Reconstructs flow embeddings while learning global co-occurrence patterns
+
+Flows with high reconstruction errors are flagged as potential intrusions. By jointly training both components end-to-end, the model achieves state-of-the-art performance on NetFlow benchmarks (up to 99.98% PR-AUC and 99.61% macro F1-score).
 
 <p align="center">
   <img src="figures/graph_repr.png" alt="Graph representation learning process" width="60%">
 </p>
 
+<p><em>Note: This implementation uses PyTorch Geometric (PyG). For reproducing the exact paper results, see the <a href="https://github.com/lorenzo9uerra/GraphIDS/">DGL branch</a>.</em></p>
+
 ## Requirements
 
-To install the requirements run this command:
+### Installation
+
+We recommend using Python 3.10+ with CUDA 12.6 support. Install dependencies with pip:
 
 ```bash
-conda env create -f environment.yml
+pip install -r requirements.txt
 ```
-To prepare the environment, activate the newly created conda environment and set the environment variables to allow reproducibility. To do so, run these commands:
+
+After installation, set the environment variables to ensure reproducibility:
 ```bash
-conda activate pyg
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 ```
 
-We use Weights & Biases for experiment tracking. For review purposes, W&B is set to offline mode by default and no login is required. All logs will be stored locally. Optionally, you can enable online mode by passing the `--wandb` parameter.
+**Note:** If you need a different CUDA version, modify the `-f` flag in `requirements.txt` to match your CUDA installation (e.g., `cu118`, `cu121`).
+
+### Datasets
 
 The datasets can be downloaded from this website: https://staff.itee.uq.edu.au/marius/NIDS_datasets/
 
@@ -45,7 +54,23 @@ unzip -d NF-UNSW-NB15-v3 -j f7546561558c07c5_NFV3DATA-A11964_A11964.zip
 NOTE: The authors recently renamed the file for the NF-CSE-CIC-IDS2018-v2 and NF-CSE-CIC-IDS2018-v3 datasets as NF-CICIDS2018-v2 and NF-CICIDS2018-v3.\
 To keep a consistent naming convention with the literature, the code expects the dataset directory and the dataset CSV file to be named as one of the 4 considered datasets: `NF-UNSW-NB15-v2`, `NF-UNSW-NB15-v3`, `NF-CSE-CIC-IDS2018-v2`, `NF-CSE-CIC-IDS2018-v3`.
 
+## Quick Start
+
+Once you have installed the dependencies and downloaded a dataset, you can train GraphIDS with:
+
+```bash
+python3 main.py --data_dir data/ --config configs/NF-UNSW-NB15-v3.yaml
+```
+
+This will train the model on the NF-UNSW-NB15-v3 dataset and automatically evaluate it after training.
+
 ## Training
+
+### Experiment Tracking
+
+We use Weights & Biases for experiment tracking. W&B is set to offline mode by default—no login is required, and all logs are stored locally. To enable online mode, pass the `--wandb` flag.
+
+### Running Training
 
 To train GraphIDS, run this command:
 
@@ -84,15 +109,6 @@ By running the command above, the model would also be evaluated after training. 
 python3 main.py --data_dir <data_dir> --config configs/<dataset_name>.yaml --checkpoint checkpoints/GraphIDS_<dataset_name>_<seed>.ckpt --test
 ```
 
-## Pretrained Models
-
-As the models are relatively lightweight, the saved checkpoints of the pretrained models can be found directly in this repository under the `pretrained/` directory. To test the pretrained models, run the following command:
-
-```bash
-python3 main.py --data_dir <data_dir> --config configs/<dataset_name>.yaml --checkpoint pretrained/GraphIDS_<dataset_name>.ckpt --test
-```
-Since the model predictions depend on feature normalization, our code automatically loads the MinMaxScaler from the `scalers/` directory. These scalers were fitted on the training data and must be used consistently for proper evaluation of pretrained models.
-
 ## Results
 
 Our model achieves the following performance on the following datasets:
@@ -128,20 +144,17 @@ The results are averaged over multiple seeds.
 If you find this work useful in your research, please consider citing our paper:
 
 ```bibtex
-@inproceedings{guerra2025self,
-  title={Self-Supervised Learning of Graph Representations for Network Intrusion Detection},
-  author={Guerra, Lorenzo and Chapuis, Thomas and Duc, Guillaume and Mozharovskyi, Pavlo and Nguyen, Van-Tam},
-  booktitle={Thirty-ninth Conference on Neural Information Processing Systems},
-  year={2025},
-  url={CHANGEME_LINK_TO_PAPER}
+@misc{guerra2025selfsupervisedlearninggraphrepresentations,
+      title={Self-Supervised Learning of Graph Representations for Network Intrusion Detection}, 
+      author={Lorenzo Guerra and Thomas Chapuis and Guillaume Duc and Pavlo Mozharovskyi and Van-Tam Nguyen},
+      year={2025},
+      eprint={2509.16625},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2509.16625}, 
 }
 ```
 
 ## License
 
 All original components of this repository are licensed under the [Apache License 2.0](./LICENSE). Third-party components are used in compliance with their respective licenses.
-
-### Third-Party Code
-- `baselines/Anomal-E/`: Contains modified components from the [Anomal-E repository](https://github.com/waimorris/Anomal-E/), which is licensed under the Apache License 2.0.
-
-- `baselines/SAFE/`: Due to the absence of a formal license in the original SAFE repository, we do **not redistribute its code**. This directory contains instructions and tooling to apply our changes externally. Users must manually download the original SAFE code from its source (https://github.com/ElvinLit/SAFE/). We have received explicit permission from the SAFE authors to use their code for research purposes.
