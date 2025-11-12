@@ -10,3 +10,4 @@ outputs
 *.npz
 baselines/SAFE/SAFE.py
 checkpoints
+scalers

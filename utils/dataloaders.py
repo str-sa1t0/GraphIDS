@@ -153,12 +153,11 @@ class PyGDataset(InMemoryDataset):
         if self.data_type == "benign":
             df_train = df_train[df_train["Label"] == 0]
 
-        scaler_path = os.path.join("scalers", f"scaler_{self.name}.pkl")
+        scaler_path = os.path.join("scalers", f"scaler_{self.name}_{self.seed}.pkl")
         if os.path.exists(scaler_path):
             try:
                 with open(scaler_path, "rb") as f:
                     scaler = pickle.load(f)
-                print(f"Loaded existing scaler from {scaler_path}")
             except Exception as e:
                 print(f"Failed to load scaler: {e}. Creating new one.")
                 scaler = MinMaxScaler()
