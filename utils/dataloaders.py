@@ -6,7 +6,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 import torch
 import torch_geometric
-from torch_geometric.data import Data, InMemoryDataset
+from torch_geometric.data import Data
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import Dataset as TorchDataset
 from torch.nn.utils.rnn import pad_sequence
@@ -48,70 +48,89 @@ class SequentialDataset(TorchDataset):
         return max(0, (len(self.data) - 1) // self.step + 1)
 
 
-class PyGDataset(InMemoryDataset):
+class NetFlowDataset:
     def __init__(
         self,
         name,
         data_dir,
-        force_reload,
+        force_reload=False,
         fraction=None,
         data_type="benign",
         seed=42,
-        split="train",
     ):
         self.name = name
         self.data_dir = data_dir
         self.fraction = fraction
         self.data_type = data_type
         self.seed = seed
-        self.split = split
 
+        # Setup directories
         graph_dir = os.path.join(data_dir, "pyg_graph_data")
         if fraction is not None:
             assert 0 < fraction < 1
             fraction_str = str(fraction).replace(".", "_")
-            self.processed_dir_path = os.path.join(graph_dir, f"{name}_{fraction_str}")
+            self.processed_dir = os.path.join(graph_dir, f"{name}_{fraction_str}")
         else:
-            self.processed_dir_path = os.path.join(graph_dir, name)
+            self.processed_dir = os.path.join(graph_dir, name)
 
-        if force_reload and os.path.exists(self.processed_dir_path):
-            print(
-                f"Force reload: Removing existing processed data at {self.processed_dir_path}"
-            )
-            shutil.rmtree(self.processed_dir_path)
-
-        super().__init__(root=self.processed_dir_path)
-
-        if split == "train":
-            self.data_list = self.load(self.processed_paths[0])
-        elif split == "val":
-            self.data_list = self.load(self.processed_paths[1])
-        elif split == "test":
-            self.data_list = self.load(self.processed_paths[2])
+        self.raw_dir = os.path.join(data_dir, name)
+        
+        # Handle force reload
+        if force_reload and os.path.exists(self.processed_dir):
+            print(f"Force reload: Removing existing processed data at {self.processed_dir}")
+            shutil.rmtree(self.processed_dir)
+            
+            # Also remove the scaler for this dataset
+            scaler_path = os.path.join("scalers", f"scaler_{self.name}.pkl")
+            if os.path.exists(scaler_path):
+                print(f"Removing old scaler: {scaler_path}")
+                os.remove(scaler_path)
+        
+        # Check if we need to process
+        if self._needs_processing():
+            # Check for seed mismatch before processing
+            seed_file = os.path.join(self.processed_dir, ".seed")
+            if os.path.exists(seed_file):
+                with open(seed_file, 'r') as f:
+                    cached_seed = int(f.read().strip())
+                if cached_seed != self.seed:
+                    print(f"Warning: Cached data was created with seed={cached_seed}, but current seed={self.seed}")
+                    print("Run with --reload_dataset to recreate data with the new seed")
+            
+            self._process()
         else:
-            raise ValueError("split must be one of 'train', 'val', 'test'")
+            # Check for seed mismatch when loading existing cache
+            seed_file = os.path.join(self.processed_dir, ".seed")
+            if os.path.exists(seed_file):
+                with open(seed_file, 'r') as f:
+                    cached_seed = int(f.read().strip())
+                if cached_seed != self.seed:
+                    print(f"Warning: Cached data was created with seed={cached_seed}, but current seed={self.seed}")
+                    print("Run with --reload_dataset to recreate data with the new seed")
+        
+        # Load the processed data
+        self.train_graph = torch.load(os.path.join(self.processed_dir, "train.pt"))[0]
+        self.val_graph = torch.load(os.path.join(self.processed_dir, "val.pt"))[0]
+        self.test_graph = torch.load(os.path.join(self.processed_dir, "test.pt"))[0]
 
-    @property
-    def raw_file_names(self):
-        return [f"{self.name}.csv"]
+    def _needs_processing(self):
+        """Check if processing is needed"""
+        if not os.path.exists(self.processed_dir):
+            return True
+        
+        required_files = ["train.pt", "val.pt", "test.pt"]
+        for filename in required_files:
+            if not os.path.exists(os.path.join(self.processed_dir, filename)):
+                return True
+        
+        return False
 
-    @property
-    def processed_file_names(self):
-        files = ["train.pt", "val.pt", "test.pt"]
-        return files
-
-    @property
-    def raw_dir(self):
-        return os.path.join(self.data_dir, self.name)
-
-    @property
-    def processed_dir(self):
-        return self.processed_dir_path
-
-    def download(self):
-        pass
-
-    def process(self):
+    def _process(self):
+        """Process the raw CSV data and create train/val/test splits"""
+        print(f"Processing dataset {self.name}...")
+        
+        os.makedirs(self.processed_dir, exist_ok=True)
+        
         df = pd.read_csv(os.path.join(self.raw_dir, f"{self.name}.csv"))
 
         if self.fraction is not None:
@@ -153,7 +172,7 @@ class PyGDataset(InMemoryDataset):
         if self.data_type == "benign":
             df_train = df_train[df_train["Label"] == 0]
 
-        scaler_path = os.path.join("scalers", f"scaler_{self.name}_{self.seed}.pkl")
+        scaler_path = os.path.join("scalers", f"scaler_{self.name}.pkl")
         if os.path.exists(scaler_path):
             try:
                 with open(scaler_path, "rb") as f:
@@ -199,7 +218,6 @@ class PyGDataset(InMemoryDataset):
         num_nodes = len(node_map)
 
         datasets = {"train": df_train, "val": df_val, "test": df_test}
-        processed_data = {}
 
         for split_name, df_split in datasets.items():
             src_nodes = np.array([node_map[ip] for ip in df_split["IPV4_SRC_ADDR"]])
@@ -217,48 +235,20 @@ class PyGDataset(InMemoryDataset):
                 edge_labels=edge_labels,
                 num_nodes=num_nodes,
             )
-            # List format for compatibility
-            processed_data[split_name] = [data]
-
-        self.save(processed_data["train"], self.processed_paths[0])
-        self.save(processed_data["val"], self.processed_paths[1])
-        self.save(processed_data["test"], self.processed_paths[2])
-
-
-class NetFlowDataset:
-    def __init__(
-        self,
-        name,
-        data_dir,
-        force_reload=False,
-        fraction=None,
-        data_type="benign",
-        seed=42,
-    ):
-        self.train_data = PyGDataset(
-            name, data_dir, force_reload, fraction, data_type, seed, split="train"
-        )
-        self.val_data = PyGDataset(
-            name, data_dir, force_reload, fraction, data_type, seed, split="val"
-        )
-        self.test_data = PyGDataset(
-            name, data_dir, force_reload, fraction, data_type, seed, split="test"
-        )
+            
+            # Save as list for compatibility
+            torch.save([data], os.path.join(self.processed_dir, f"{split_name}.pt"))
+        
+        # Save seed information for cache validation
+        seed_file = os.path.join(self.processed_dir, ".seed")
+        with open(seed_file, 'w') as f:
+            f.write(str(self.seed))
+        
+        print("Done!")
 
     def __len__(self):
-        return len(self.train_data) + len(self.val_data) + len(self.test_data)
-
-    @property
-    def train_graph(self):
-        return self.train_data[0]
-
-    @property
-    def val_graph(self):
-        return self.val_data[0]
-
-    @property
-    def test_graph(self):
-        return self.test_data[0]
+        # Return total number of graphs (for compatibility)
+        return 3
 
     @property
     def num_node_features(self):
