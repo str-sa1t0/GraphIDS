@@ -1,9 +1,12 @@
+# PyG-specific package index for CUDA-enabled builds
+-f https://data.pyg.org/whl/torch-2.8.0+cu126.html
+
 # Core PyTorch and PyTorch Geometric
 torch==2.8.0
 torch-geometric==2.7.0
-pyg_lib==0.5.0+pt28cu126
 torchaudio==2.8.0
 torchvision==0.23.0
+pyg_lib
 
 # Machine Learning
 scikit-learn>=1.7.2
@@ -18,6 +21,3 @@ wandb>=0.22.3
 
 # Configuration
 pyyaml>=6.0
-
-# PyG-specific package index for CUDA-enabled builds
--f https://data.pyg.org/whl/torch-2.8.0+cu126.html
