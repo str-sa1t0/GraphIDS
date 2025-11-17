@@ -2,7 +2,7 @@
 
 # Self-Supervised Learning of Graph Representations for Network Intrusion Detection
 
-This repository provides the official code and pretrained models for our paper, accepted at NeurIPS 2025.
+This repository provides the official code for our paper, accepted at NeurIPS 2025.
 
 ## Overview
 
@@ -16,7 +16,8 @@ Flows with high reconstruction errors are flagged as potential intrusions. By jo
   <img src="figures/full_pipeline.png" alt="Graph representation learning process">
 </p>
 
-*Note: This implementation uses PyTorch Geometric (PyG). For reproducing the exact paper results, see the [DGL branch](https://github.com/lorenzo9uerra/GraphIDS/tree/dgl).*
+*Note: This implementation uses PyTorch Geometric (PyG) for improved maintainability and broader compatibility. For exact reproduction of the paper results and pretrained models, see the [DGL branch](https://github.com/lorenzo9uerra/GraphIDS/tree/dgl).*
+
 
 ## Requirements
 
