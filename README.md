@@ -23,19 +23,17 @@ Flows with high reconstruction errors are flagged as potential intrusions. By jo
 
 ### Installation
 
-We recommend using Python 3.10+ with CUDA 12.6 support. Install dependencies with pip:
+This project uses [uv](https://docs.astral.sh/uv/) for project management.
+
+Sync the project dependencies:
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
-After installation, set the environment variables to ensure reproducibility:
-```bash
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUBLAS_WORKSPACE_CONFIG=:4096:8
-```
+This will create a virtual environment and install all dependencies specified in `pyproject.toml`.
 
-**Note:** If you need a different CUDA version, modify the `-f` flag in `requirements.txt` to match your CUDA installation (e.g., `cu118`, `cu121`).
+**Note:** The project is configured for CUDA 12.8. If you need a different CUDA version, modify the `[tool.uv.index]` URL in `pyproject.toml`.
 
 ### Datasets
 
@@ -60,7 +58,7 @@ To keep a consistent naming convention with the literature, the code expects the
 Once you have installed the dependencies and downloaded a dataset, you can train GraphIDS with:
 
 ```bash
-python3 main.py --data_dir data/ --config configs/NF-UNSW-NB15-v3.yaml
+uv run main.py --data_dir data/ --config configs/NF-UNSW-NB15-v3.yaml
 ```
 
 This will train the model on the NF-UNSW-NB15-v3 dataset and automatically evaluate it after training.
@@ -76,7 +74,7 @@ We use Weights & Biases for experiment tracking. W&B is set to offline mode by d
 To train GraphIDS, run this command:
 
 ```bash
-python3 main.py --data_dir <data_dir> --config configs/<dataset_name>.yaml
+uv run main.py --data_dir <data_dir> --config configs/<dataset_name>.yaml
 ```
 `<data_dir>` should point to the directory containing all the datasets. The code expects the directory structure found in the zip files (i.e., each CSV file should be located at `<data_dir>/<dataset_name>/<dataset_name>.csv`). For example, for the following directory structure:
 ```
@@ -94,12 +92,12 @@ configs/
 ```
 You should run:
 ```bash
-python3 main.py --data_dir data/ --config configs/NF-UNSW-NB15-v3.yaml
+uv run main.py --data_dir data/ --config configs/NF-UNSW-NB15-v3.yaml
 ```
 
 To specify different training parameters, you can either modify the configuration file in the `configs/` directory, or provide all parameters using command-line arguments. The full list of possible arguments can be accessed by running the command:
 ```bash
-python3 main.py --help
+uv run main.py --help
 ```
 
 ## Evaluation
@@ -107,7 +105,30 @@ python3 main.py --help
 By running the command above, the model would also be evaluated after training. However, to only evaluate the model from a saved checkpoint, run the following command:
 
 ```bash
-python3 main.py --data_dir <data_dir> --config configs/<dataset_name>.yaml --checkpoint checkpoints/GraphIDS_<dataset_name>_<seed>.ckpt --test
+uv run main.py --data_dir <data_dir> --config configs/<dataset_name>.yaml --checkpoint checkpoints/GraphIDS_<dataset_name>_<seed>.ckpt --test
+```
+
+## Development
+
+If you plan to modify the code, we recommend installing the development dependencies:
+
+```bash
+uv sync --extra dev
+```
+
+This installs `ruff` for linting and formatting, and `pre-commit` hooks.
+
+To set up the git hooks:
+
+```bash
+uv run pre-commit install
+```
+
+To run the linter and formatter manually:
+
+```bash
+uv run ruff check .
+uv run ruff format .
 ```
 
 ## Results
@@ -138,7 +159,7 @@ Our model achieves the following performance on the following datasets:
 | ------------------ | ---------------- | -------------- |
 | GraphIDS           |      94.31%      |      92.01%    |
 
-The results are averaged over multiple seeds. 
+The results are averaged over multiple seeds.
 
 ## Citation
 

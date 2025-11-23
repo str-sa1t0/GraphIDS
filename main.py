@@ -1,15 +1,17 @@
-import numpy as np
-import random
-import torch
-import wandb
 import os
-from models.GraphIDS import GraphIDS
-from torch_geometric.loader import LinkNeighborLoader
-from utils.dataloaders import NetFlowDataset
-from utils.trainers import test, train_encoder
-from utils.parser import Parser
+import random
 import warnings
+
+import numpy as np
+import torch
 from sklearn.metrics import precision_recall_curve
+from torch_geometric.loader import LinkNeighborLoader
+
+import wandb
+from models.graphids import GraphIDS
+from utils.dataloaders import NetFlowDataset
+from utils.parser import Parser
+from utils.trainers import test, train_encoder
 
 # Suppress this warning: even if in prototype stage, it works correctly for our use case
 warnings.filterwarnings(
@@ -24,8 +26,6 @@ def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
 
 
 def main(run):
@@ -80,19 +80,13 @@ def main(run):
         start_epoch, threshold = model.load_checkpoint(checkpoint, optimizer)
         run.config.epoch = start_epoch
     else:
-        if config.wandb:
-            checkpoint_id = run.name
-        else:
-            checkpoint_id = config.seed
+        checkpoint_id = run.name if config.wandb else config.seed
         checkpoint = f"checkpoints/GraphIDS_{config.dataset}_{checkpoint_id}.ckpt"
         os.makedirs(os.path.dirname(checkpoint), exist_ok=True)
         start_epoch = 0
         threshold = None
 
-    if config.positional_encoding == "None":
-        shuffle = True
-    else:
-        shuffle = False
+    shuffle = config.positional_encoding == "None"
     fanout_list = [config.fanout] if config.fanout != -1 else [-1]
 
     if torch.cuda.is_available():

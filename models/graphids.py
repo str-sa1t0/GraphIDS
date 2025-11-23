@@ -6,7 +6,7 @@ from torch_geometric.utils import scatter
 
 class SAGELayer(MessagePassing):
     def __init__(self, ndim_in, edim_in, edim_out, agg_type="mean", dropout_rate=0.0):
-        super(SAGELayer, self).__init__(aggr=agg_type)
+        super().__init__(aggr=agg_type)
         self.fc_neigh = nn.Linear(edim_in, ndim_in)
         self.fc_edge = nn.Linear(ndim_in * 2, edim_out)
         self.relu = nn.ReLU()
@@ -76,7 +76,7 @@ class SAGELayer(MessagePassing):
 
 class LearnablePositionalEncoding(nn.Module):
     def __init__(self, embed_dim, max_len=512):
-        super(LearnablePositionalEncoding, self).__init__()
+        super().__init__()
         self.pe = nn.Parameter(torch.zeros(max_len, embed_dim))
         nn.init.xavier_uniform_(self.pe)
 
@@ -86,7 +86,7 @@ class LearnablePositionalEncoding(nn.Module):
 
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, embed_dim, max_len=512):
-        super(SinusoidalPositionalEncoding, self).__init__()
+        super().__init__()
 
         pe = torch.zeros(max_len, embed_dim)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
@@ -114,7 +114,7 @@ class TransformerAutoencoder(nn.Module):
         positional_encoding,
         mask_ratio,
     ):
-        super(TransformerAutoencoder, self).__init__()
+        super().__init__()
         if positional_encoding == "learnable":
             self.positional_encoder = LearnablePositionalEncoding(
                 embed_dim, window_size
@@ -213,7 +213,7 @@ class GraphIDS(nn.Module):
         agg_type="mean",
         mask_ratio=0.15,
     ):
-        super(GraphIDS, self).__init__()
+        super().__init__()
         self.encoder = SAGELayer(ndim_in, edim_in, edim_out, agg_type, dropout)
         self.transformer = TransformerAutoencoder(
             edim_out,

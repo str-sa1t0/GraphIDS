@@ -1,9 +1,10 @@
 import time
-from sklearn.metrics import average_precision_score, f1_score
+
 import torch
-from tqdm import tqdm
 import torch.nn as nn
+from sklearn.metrics import average_precision_score, f1_score
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from utils.dataloaders import SequentialDataset, collate_fn
 

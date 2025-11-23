@@ -1,0 +1,65 @@
+[project]
+name = "graphids"
+version = "0.1.0"
+description = "Self-supervised GNN for Network Intrusion Detection"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch==2.8.0",
+    "torch-geometric==2.7.0",
+    "torchaudio==2.8.0",
+    "torchvision==0.23.0",
+    "pyg_lib",
+    "scikit-learn>=1.7.2",
+    "numpy>=2.3.4",
+    "scipy>=1.16.3",
+    "pandas>=2.3.3",
+    "wandb>=0.22.3",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit>=4.0.0",
+    "ruff>=0.14.0",
+]
+
+[tool.uv.sources]
+pyg_lib = [ { index = "pyg" } ]
+
+[[tool.uv.index]]
+name = "pyg"
+url = "https://data.pyg.org/whl/torch-2.8.0+cu128.html"
+format = "flat"
+
+[tool.ruff]
+line-length = 88
+indent-width = 4
+
+[tool.ruff.lint]
+# Enable specific rule categories
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort (import sorting)
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+]
+
+ignore = [
+    "E501",   # Line too long (handled by formatter)
+]
+
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

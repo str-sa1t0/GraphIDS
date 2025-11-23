@@ -3,7 +3,7 @@ import argparse
 
 class Parser(argparse.ArgumentParser):
     def __init__(self):
-        super(Parser, self).__init__(description="GraphIDS")
+        super().__init__(description="GraphIDS")
         self.add_argument(
             "--config",
             type=str,

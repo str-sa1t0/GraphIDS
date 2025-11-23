@@ -1,15 +1,16 @@
 import os
 import pickle
 import shutil
-import pandas as pd
+
 import numpy as np
-from sklearn.model_selection import train_test_split
+import pandas as pd
 import torch
 import torch_geometric
-from torch_geometric.data import Data
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-from torch.utils.data import Dataset as TorchDataset
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset as TorchDataset
+from torch_geometric.data import Data
 
 torch.serialization.add_safe_globals(
     [
@@ -21,7 +22,7 @@ torch.serialization.add_safe_globals(
 
 
 def collate_fn(batch):
-    sequences, masks = zip(*batch)
+    sequences, masks = zip(*batch, strict=False)
     sequences_padded = pad_sequence(sequences, batch_first=True, padding_value=0)
     masks_padded = pad_sequence(masks, batch_first=True, padding_value=0)
     return sequences_padded, masks_padded
@@ -74,40 +75,50 @@ class NetFlowDataset:
             self.processed_dir = os.path.join(graph_dir, name)
 
         self.raw_dir = os.path.join(data_dir, name)
-        
+
         # Handle force reload
         if force_reload and os.path.exists(self.processed_dir):
-            print(f"Force reload: Removing existing processed data at {self.processed_dir}")
+            print(
+                f"Force reload: Removing existing processed data at {self.processed_dir}"
+            )
             shutil.rmtree(self.processed_dir)
-            
+
             # Also remove the scaler for this dataset
             scaler_path = os.path.join("scalers", f"scaler_{self.name}.pkl")
             if os.path.exists(scaler_path):
                 print(f"Removing old scaler: {scaler_path}")
                 os.remove(scaler_path)
-        
+
         # Check if we need to process
         if self._needs_processing():
             # Check for seed mismatch before processing
             seed_file = os.path.join(self.processed_dir, ".seed")
             if os.path.exists(seed_file):
-                with open(seed_file, 'r') as f:
+                with open(seed_file) as f:
                     cached_seed = int(f.read().strip())
                 if cached_seed != self.seed:
-                    print(f"Warning: Cached data was created with seed={cached_seed}, but current seed={self.seed}")
-                    print("Run with --reload_dataset to recreate data with the new seed")
-            
+                    print(
+                        f"Warning: Cached data was created with seed={cached_seed}, but current seed={self.seed}"
+                    )
+                    print(
+                        "Run with --reload_dataset to recreate data with the new seed"
+                    )
+
             self._process()
         else:
             # Check for seed mismatch when loading existing cache
             seed_file = os.path.join(self.processed_dir, ".seed")
             if os.path.exists(seed_file):
-                with open(seed_file, 'r') as f:
+                with open(seed_file) as f:
                     cached_seed = int(f.read().strip())
                 if cached_seed != self.seed:
-                    print(f"Warning: Cached data was created with seed={cached_seed}, but current seed={self.seed}")
-                    print("Run with --reload_dataset to recreate data with the new seed")
-        
+                    print(
+                        f"Warning: Cached data was created with seed={cached_seed}, but current seed={self.seed}"
+                    )
+                    print(
+                        "Run with --reload_dataset to recreate data with the new seed"
+                    )
+
         # Load the processed data
         self.train_graph = torch.load(os.path.join(self.processed_dir, "train.pt"))[0]
         self.val_graph = torch.load(os.path.join(self.processed_dir, "val.pt"))[0]
@@ -117,20 +128,20 @@ class NetFlowDataset:
         """Check if processing is needed"""
         if not os.path.exists(self.processed_dir):
             return True
-        
+
         required_files = ["train.pt", "val.pt", "test.pt"]
         for filename in required_files:
             if not os.path.exists(os.path.join(self.processed_dir, filename)):
                 return True
-        
+
         return False
 
     def _process(self):
         """Process the raw CSV data and create train/val/test splits"""
         print(f"Processing dataset {self.name}...")
-        
+
         os.makedirs(self.processed_dir, exist_ok=True)
-        
+
         df = pd.read_csv(os.path.join(self.raw_dir, f"{self.name}.csv"))
 
         if self.fraction is not None:
@@ -138,16 +149,16 @@ class NetFlowDataset:
                 frac=self.fraction, random_state=self.seed
             )
 
-        X = df.drop(columns=["Attack", "Label"])
+        x = df.drop(columns=["Attack", "Label"])
         y = df[["Attack", "Label"]]
 
-        X = X.replace([np.inf, -np.inf], np.nan)
-        X = X.fillna(0)
+        x = x.replace([np.inf, -np.inf], np.nan)
+        x = x.fillna(0)
 
         if "v3" in self.name:
             edge_features = [
                 col
-                for col in X.columns
+                for col in x.columns
                 if col
                 not in [
                     "IPV4_SRC_ADDR",
@@ -159,11 +170,11 @@ class NetFlowDataset:
         else:
             edge_features = [
                 col
-                for col in X.columns
+                for col in x.columns
                 if col not in ["IPV4_SRC_ADDR", "IPV4_DST_ADDR"]
             ]
 
-        df = pd.concat([X, y], axis=1)
+        df = pd.concat([x, y], axis=1)
 
         df_train, df_val_test = train_test_split(
             df, test_size=0.2, random_state=self.seed, stratify=y["Attack"]
@@ -235,15 +246,15 @@ class NetFlowDataset:
                 edge_labels=edge_labels,
                 num_nodes=num_nodes,
             )
-            
+
             # Save as list for compatibility
             torch.save([data], os.path.join(self.processed_dir, f"{split_name}.pt"))
-        
+
         # Save seed information for cache validation
         seed_file = os.path.join(self.processed_dir, ".seed")
-        with open(seed_file, 'w') as f:
+        with open(seed_file, "w") as f:
             f.write(str(self.seed))
-        
+
         print("Done!")
 
     def __len__(self):
