@@ -14,9 +14,9 @@ from torch_geometric.data import Data
 
 torch.serialization.add_safe_globals(
     [
-        torch_geometric.data.data.DataEdgeAttr,
-        torch_geometric.data.data.DataTensorAttr,
-        torch_geometric.data.storage.GlobalStorage,
+        torch_geometric.data.data.DataEdgeAttr,  # type: ignore[attr-defined]
+        torch_geometric.data.data.DataTensorAttr,  # type: ignore[attr-defined]
+        torch_geometric.data.storage.GlobalStorage,  # type: ignore[attr-defined]
     ]
 )
 

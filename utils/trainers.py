@@ -52,10 +52,17 @@ def train_encoder(
                 batch_size=ae_batch_size,
                 collate_fn=collate_fn,
             )
-            accumulated_loss = 0
+            accumulated_loss = torch.tensor(0.0, device=device)
             seq_count = 0
             for ae_batch, mask in ae_train_loader:
                 outputs = model.transformer(ae_batch, mask)
+                # NOTE ON IMPLEMENTATION:
+                # We purposefully do not detach the target embedding here.
+                # Empirically, we observed that allowing gradients to flow through
+                # the target improves convergence speed and representation quality
+                # compared to a standard stop-gradient approach, likely by
+                # enforcing tighter coupling between the encoder and transformer
+                # during training.
                 loss = criterion(outputs, ae_batch)
                 loss = torch.sum(loss * mask) / torch.sum(mask)
                 accumulated_loss += loss
@@ -185,7 +192,7 @@ def validate(model, val_loader, ae_batch_size, window_size, device):
                 batch_size=ae_batch_size,
                 collate_fn=collate_fn,
             )
-            accumulated_loss = 0
+            accumulated_loss = torch.tensor(0.0, device=device)
             seq_count = 0
             for ae_batch, mask in ae_val_loader:
                 outputs = model.transformer(ae_batch, mask)

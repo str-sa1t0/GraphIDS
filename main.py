@@ -91,7 +91,8 @@ def main(run):
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
-    recommended_workers = min(os.cpu_count(), 6)
+    cpu_count = os.cpu_count()
+    recommended_workers = min(cpu_count, 6) if cpu_count is not None else 0
     if start_epoch >= config.num_epochs or config.test:
         print("Model already trained")
         test_loader = LinkNeighborLoader(

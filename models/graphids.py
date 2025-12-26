@@ -11,7 +11,7 @@ class SAGELayer(MessagePassing):
         self.fc_edge = nn.Linear(ndim_in * 2, edim_out)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout_rate)
-        self.agg_type = agg_type
+        self.agg_type : str = agg_type
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -19,7 +19,7 @@ class SAGELayer(MessagePassing):
         nn.init.xavier_normal_(self.fc_neigh.weight, gain=gain)
         nn.init.xavier_normal_(self.fc_edge.weight, gain=gain)
 
-    def message(self, edge_attr):
+    def message(self, edge_attr):  # type: ignore[override]
         """
         Copy edge features as messages.
         DGL equivalent: fn.copy_e("h", "m")
@@ -55,7 +55,7 @@ class SAGELayer(MessagePassing):
             4. Project to final edge embeddings: fc_edge + dropout
         """
         # Aggregate edge features to nodes (DGL: fn.copy_e + fn.mean)
-        node_embeddings = self.propagate(
+        node_embeddings = self.propagate(  # type: ignore
             edge_index, edge_attr=edge_attr, size=(num_nodes, num_nodes)
         )
         # Transform aggregated features and activate
@@ -96,7 +96,7 @@ class SinusoidalPositionalEncoding(nn.Module):
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
+        self.pe = pe
 
     def forward(self, x):
         return x + self.pe[: x.size(1), :]
@@ -124,7 +124,7 @@ class TransformerAutoencoder(nn.Module):
                 embed_dim, window_size
             )
         else:
-            self.positional_encoder = None
+            self.positional_encoder = nn.Identity()
         self.input_projection = nn.Linear(input_dim, embed_dim)
         self.mask_ratio = mask_ratio
         self.encoder_layer = nn.TransformerEncoderLayer(
@@ -159,8 +159,8 @@ class TransformerAutoencoder(nn.Module):
     def forward(self, src, padding_mask=None):
         src = self.input_projection(src)
 
-        if self.positional_encoder is not None:
-            src = self.positional_encoder(src)
+        # Identity function if no positional encoding is used
+        src = self.positional_encoder(src)
 
         src_key_padding_mask = None
         if padding_mask is not None:
