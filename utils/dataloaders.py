@@ -1,6 +1,7 @@
 import os
 import pickle
 import shutil
+from typing import Optional, List
 
 import numpy as np
 import pandas as pd
@@ -33,10 +34,7 @@ class SequentialDataset(TorchDataset):
         self.data = data
         self.window = window
         self.device = device
-        if step is None:
-            self.step = window
-        else:
-            self.step = step
+        self.step = window if step is None else step
 
     def __getitem__(self, index):
         start_idx = index * self.step
@@ -47,6 +45,22 @@ class SequentialDataset(TorchDataset):
 
     def __len__(self):
         return max(0, (len(self.data) - 1) // self.step + 1)
+
+
+def _node_to_display_str(v) -> str:
+
+    s = str(v)
+    if "." in s:
+        return s
+    try:
+        iv = int(float(v))
+        if (2**24) <= iv <= (2**32 - 1):
+            import ipaddress
+            return str(ipaddress.IPv4Address(iv))
+    except Exception:
+        pass
+
+    return s
 
 
 class NetFlowDataset:
@@ -78,9 +92,7 @@ class NetFlowDataset:
 
         # Handle force reload
         if force_reload and os.path.exists(self.processed_dir):
-            print(
-                f"Force reload: Removing existing processed data at {self.processed_dir}"
-            )
+            print(f"Force reload: Removing existing processed data at {self.processed_dir}")
             shutil.rmtree(self.processed_dir)
 
             # Also remove the scaler for this dataset
@@ -89,65 +101,47 @@ class NetFlowDataset:
                 print(f"Removing old scaler: {scaler_path}")
                 os.remove(scaler_path)
 
-        # Check if we need to process
+        # Process if needed
         if self._needs_processing():
-            # Check for seed mismatch before processing
-            seed_file = os.path.join(self.processed_dir, ".seed")
-            if os.path.exists(seed_file):
-                with open(seed_file) as f:
-                    cached_seed = int(f.read().strip())
-                if cached_seed != self.seed:
-                    print(
-                        f"Warning: Cached data was created with seed={cached_seed}, but current seed={self.seed}"
-                    )
-                    print(
-                        "Run with --reload_dataset to recreate data with the new seed"
-                    )
-
             self._process()
-        else:
-            # Check for seed mismatch when loading existing cache
-            seed_file = os.path.join(self.processed_dir, ".seed")
-            if os.path.exists(seed_file):
-                with open(seed_file) as f:
-                    cached_seed = int(f.read().strip())
-                if cached_seed != self.seed:
-                    print(
-                        f"Warning: Cached data was created with seed={cached_seed}, but current seed={self.seed}"
-                    )
-                    print(
-                        "Run with --reload_dataset to recreate data with the new seed"
-                    )
 
-        # Load the processed data
+        # Load processed graphs
         self.train_graph = torch.load(os.path.join(self.processed_dir, "train.pt"))[0]
         self.val_graph = torch.load(os.path.join(self.processed_dir, "val.pt"))[0]
         self.test_graph = torch.load(os.path.join(self.processed_dir, "test.pt"))[0]
 
+        # ★ ここが重要：node_id -> 元IP の mapping をロード
+        self.mapping: Optional[List[str]] = None
+        mapping_path = os.path.join(self.processed_dir, "node_mapping.pkl")
+        if os.path.exists(mapping_path):
+            with open(mapping_path, "rb") as f:
+                self.mapping = pickle.load(f)
+            print(f"[OK] loaded node mapping: {mapping_path} (size={len(self.mapping)})")
+        else:
+            print("[WARN] node_mapping.pkl not found. src_ip/dst_ip will remain as node IDs.")
+
     def _needs_processing(self):
-        """Check if processing is needed"""
         if not os.path.exists(self.processed_dir):
             return True
-
-        required_files = ["train.pt", "val.pt", "test.pt"]
+        required_files = ["train.pt", "val.pt", "test.pt", "node_mapping.pkl"]
         for filename in required_files:
             if not os.path.exists(os.path.join(self.processed_dir, filename)):
                 return True
-
         return False
 
     def _process(self):
-        """Process the raw CSV data and create train/val/test splits"""
         print(f"Processing dataset {self.name}...")
-
         os.makedirs(self.processed_dir, exist_ok=True)
 
         df = pd.read_csv(os.path.join(self.raw_dir, f"{self.name}.csv"))
 
         if self.fraction is not None:
-            df = df.groupby(by="Attack").sample(
-                frac=self.fraction, random_state=self.seed
-            )
+            df = df.groupby(by="Attack").sample(frac=self.fraction, random_state=self.seed)
+
+        # ★ ランキング用に raw メタ情報を保持（スケーリングされない列として退避）
+        for col in ["FLOW_START_MILLISECONDS", "FLOW_END_MILLISECONDS", "L4_DST_PORT", "PROTOCOL"]:
+            if col in df.columns:
+                df[col + "_RAW"] = df[col]
 
         x = df.drop(columns=["Attack", "Label"])
         y = df[["Attack", "Label"]]
@@ -157,10 +151,8 @@ class NetFlowDataset:
 
         if "v3" in self.name:
             edge_features = [
-                col
-                for col in x.columns
-                if col
-                not in [
+                col for col in x.columns
+                if col not in [
                     "IPV4_SRC_ADDR",
                     "IPV4_DST_ADDR",
                     "FLOW_END_MILLISECONDS",
@@ -169,8 +161,7 @@ class NetFlowDataset:
             ]
         else:
             edge_features = [
-                col
-                for col in x.columns
+                col for col in x.columns
                 if col not in ["IPV4_SRC_ADDR", "IPV4_DST_ADDR"]
             ]
 
@@ -200,6 +191,7 @@ class NetFlowDataset:
                 pickle.dump(scaler, f)
 
         df_train[edge_features] = scaler.transform(df_train[edge_features])
+
         df_val_test_scaled = scaler.transform(df_val_test[edge_features])
         df_val_test[edge_features] = np.clip(df_val_test_scaled, -10, 10)
 
@@ -210,11 +202,12 @@ class NetFlowDataset:
             stratify=df_val_test["Attack"],
         )
 
-        if "v3" in self.name:
+        if "v3" in self.name and "FLOW_START_MILLISECONDS" in df_train.columns:
             df_train = df_train.sort_values(by="FLOW_START_MILLISECONDS")
             df_val = df_val.sort_values(by="FLOW_START_MILLISECONDS")
             df_test = df_test.sort_values(by="FLOW_START_MILLISECONDS")
 
+        # ★ ノード集合→ node_id 付与
         unique_nodes = pd.concat(
             [
                 df_train["IPV4_SRC_ADDR"],
@@ -223,34 +216,56 @@ class NetFlowDataset:
                 df_val["IPV4_DST_ADDR"],
                 df_test["IPV4_SRC_ADDR"],
                 df_test["IPV4_DST_ADDR"],
-            ]
+            ],
+            ignore_index=True,
         ).unique()
+
         node_map = {node: i for i, node in enumerate(unique_nodes)}
         num_nodes = len(node_map)
+
+        # ★ 逆引き mapping（idx -> 元IP文字列）を作成＆保存
+        mapping = [_node_to_display_str(v) for v in unique_nodes]
+        mapping_path = os.path.join(self.processed_dir, "node_mapping.pkl")
+        with open(mapping_path, "wb") as f:
+            pickle.dump(mapping, f)
+        print(f"[OK] saved node mapping: {mapping_path} (size={len(mapping)})")
 
         datasets = {"train": df_train, "val": df_val, "test": df_test}
 
         for split_name, df_split in datasets.items():
-            src_nodes = np.array([node_map[ip] for ip in df_split["IPV4_SRC_ADDR"]])
-            dst_nodes = np.array([node_map[ip] for ip in df_split["IPV4_DST_ADDR"]])
-            edge_index = torch.tensor(
-                np.array([src_nodes, dst_nodes]), dtype=torch.long
-            )
+            src_nodes = np.array([node_map[ip] for ip in df_split["IPV4_SRC_ADDR"]], dtype=np.int64)
+            dst_nodes = np.array([node_map[ip] for ip in df_split["IPV4_DST_ADDR"]], dtype=np.int64)
+
+            edge_index = torch.tensor(np.array([src_nodes, dst_nodes]), dtype=torch.long)
             edge_attr = torch.tensor(df_split[edge_features].values, dtype=torch.float)
             edge_labels = torch.tensor(df_split["Label"].values, dtype=torch.long)
-            x = torch.ones(num_nodes, edge_attr.shape[1], dtype=torch.float)
+
+            # GraphIDSの実装に合わせて node feature は1固定
+            x_node = torch.ones(num_nodes, edge_attr.shape[1], dtype=torch.float)
+
             data = Data(
-                x=x,
+                x=x_node,
                 edge_index=edge_index,
                 edge_attr=edge_attr,
                 edge_labels=edge_labels,
                 num_nodes=num_nodes,
             )
 
-            # Save as list for compatibility
+            # ★ 元の raw メタ情報を data に追加保存
+            if "FLOW_START_MILLISECONDS_RAW" in df_split.columns:
+                ts_ms = df_split["FLOW_START_MILLISECONDS_RAW"].fillna(0).astype(np.int64).to_numpy()
+                data.TIMESTAMP = torch.tensor(ts_ms * 1_000_000, dtype=torch.long)
+
+            if "L4_DST_PORT_RAW" in df_split.columns:
+                dport = df_split["L4_DST_PORT_RAW"].fillna(0).astype(np.int64).to_numpy()
+                data.L4_DST_PORT = torch.tensor(dport, dtype=torch.long)
+
+            if "PROTOCOL_RAW" in df_split.columns:
+                proto = df_split["PROTOCOL_RAW"].fillna(0).astype(np.int64).to_numpy()
+                data.PROTOCOL = torch.tensor(proto, dtype=torch.long)
+
             torch.save([data], os.path.join(self.processed_dir, f"{split_name}.pt"))
 
-        # Save seed information for cache validation
         seed_file = os.path.join(self.processed_dir, ".seed")
         with open(seed_file, "w") as f:
             f.write(str(self.seed))
@@ -258,7 +273,6 @@ class NetFlowDataset:
         print("Done!")
 
     def __len__(self):
-        # Return total number of graphs (for compatibility)
         return 3
 
     @property

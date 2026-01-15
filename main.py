@@ -1,6 +1,7 @@
 import os
 import random
 import warnings
+import pandas as pd
 
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ from torch_geometric.loader import LinkNeighborLoader
 import wandb
 from models.graphids import GraphIDS
 from utils.dataloaders import NetFlowDataset
+import rank_ips
 from utils.parser import Parser
 from utils.trainers import test, train_encoder
 
@@ -21,17 +23,59 @@ warnings.filterwarnings(
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def set_seed(seed):
+def set_seed(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _to_list_mapping(node_mapping, idx_array: np.ndarray) -> list[str]:
+    """
+    node_mapping があれば node_id -> ip文字列へ変換。
+    無ければ node_id を文字列として返す（ランキングを止めないため）。
+    """
+    if node_mapping is None:
+        return [str(int(i)) for i in idx_array]
+    try:
+        return [str(node_mapping[int(i)]) for i in idx_array]
+    except Exception:
+        # 変換に失敗しても止めない（型や範囲ズレ対策）
+        return [str(int(i)) for i in idx_array]
+
+
+def _maybe_get_edge_attr_numpy(g, attr_name: str, expected_len: int) -> np.ndarray | None:
+    """
+    PyG Data の属性が存在し、かつ edge数に合うなら numpy で返す。
+    例: g.TIMESTAMP, g.L4_DST_PORT, g.PROTOCOL など
+    """
+    if not hasattr(g, attr_name):
+        return None
+    x = getattr(g, attr_name)
+    if x is None:
+        return None
+    try:
+        if torch.is_tensor(x):
+            x = x.detach().cpu().numpy()
+        else:
+            x = np.asarray(x)
+    except Exception:
+        return None
+
+    # shape補正（(E,1) -> (E,)）
+    if x.ndim >= 2 and x.shape[0] == expected_len and x.shape[1] == 1:
+        x = x.reshape(-1)
+
+    if x.shape[0] != expected_len:
+        return None
+    return x
 
 
 def main(run):
     config = run.config
-
-    set_seed(config.seed)
+    set_seed(int(config.seed))
 
     dataset = NetFlowDataset(
         name=config.dataset,
@@ -74,6 +118,7 @@ def main(run):
         ],
         lr=config.learning_rate,
     )
+
     checkpoint = config.checkpoint
     if checkpoint is not None and os.path.exists(checkpoint):
         print("Loading model from checkpoint")
@@ -91,8 +136,10 @@ def main(run):
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+
     cpu_count = os.cpu_count()
     recommended_workers = min(cpu_count, 6) if cpu_count is not None else 0
+
     if start_epoch >= config.num_epochs or config.test:
         print("Model already trained")
         test_loader = LinkNeighborLoader(
@@ -101,7 +148,7 @@ def main(run):
             edge_label_index=dataset.test_graph.edge_index,
             edge_label=dataset.test_graph.edge_labels,
             batch_size=config.batch_size,
-            shuffle=shuffle,
+            shuffle=False,
             num_workers=recommended_workers,
             pin_memory=True,
             persistent_workers=True,
@@ -138,12 +185,13 @@ def main(run):
             edge_label_index=dataset.test_graph.edge_index,
             edge_label=dataset.test_graph.edge_labels,
             batch_size=config.batch_size,
-            shuffle=shuffle,
+            shuffle=False,
             num_workers=recommended_workers,
             pin_memory=True,
             persistent_workers=True,
             drop_last=False,
         )
+
         print("Starting training...")
         model, threshold = train_encoder(
             model,
@@ -170,7 +218,9 @@ def main(run):
         device,
         threshold=threshold,
     )
+
     precision, recall, _ = precision_recall_curve(test_labels.cpu(), errors.cpu())
+
     if config.save_curve:
         run.log(
             {
@@ -187,15 +237,18 @@ def main(run):
             precision=precision,
             recall=recall,
         )
+
     test_pred = (errors > threshold).int()
     print(f"Test macro F1-score: {test_f1:.4f}")
     print(f"Test PR-AUC: {test_pr_auc:.4f}")
     print(f"Test prediction time: {prediction_time:.4f} seconds")
+
     if torch.cuda.is_available():
         peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
         print(f"Peak GPU memory usage: {peak_memory_mb:.2f} MB")
     else:
-        peak_memory_mb = 0
+        peak_memory_mb = 0.0
+
     run.log(
         {
             "final_test_f1": test_f1,
@@ -211,6 +264,138 @@ def main(run):
             ),
         }
     )
+
+
+    # --- Post-processing: Suspicious IP Ranking ---
+    print("Generating suspicious IP ranking...")
+
+    
+    run_id = run.name if getattr(run, "name", None) is not None else (
+        run.id if getattr(run, "id", None) is not None else f"seed{config.seed}"
+    )
+
+    # 1) node_id -> ip 変換用 mapping を可能な範囲で復元
+    node_mapping = getattr(dataset, "mapping", None)
+
+    if node_mapping is None:
+        for cand in ["idx2ip", "idx2node", "id2ip", "id2node", "node_mapping"]:
+            if hasattr(dataset, cand):
+                node_mapping = getattr(dataset, cand)
+                break
+
+    if node_mapping is None and hasattr(dataset, "node_encoder"):
+        enc = getattr(dataset, "node_encoder")
+        if hasattr(enc, "classes_"):
+            node_mapping = list(enc.classes_)
+
+    def idx_to_name(i: int) -> str:
+        """
+        node_mapping が list/dict のどちらでも動くようにする
+        """
+        if node_mapping is None:
+            return str(i)
+
+        if isinstance(node_mapping, list):
+            if 0 <= i < len(node_mapping):
+                return str(node_mapping[i])
+            return str(i)
+
+        if isinstance(node_mapping, dict):
+            if i in node_mapping:
+                return str(node_mapping[i])
+            # keyが文字列のケースも吸収
+            if str(i) in node_mapping:
+                return str(node_mapping[str(i)])
+            return str(i)
+
+        return str(i)
+
+
+    try:
+        # 2) エッジ情報を取得
+        if hasattr(dataset.test_graph, "edge_label_index") and dataset.test_graph.edge_label_index is not None:
+            edge_index_t = dataset.test_graph.edge_label_index
+        else:
+            edge_index_t = dataset.test_graph.edge_index
+
+        edge_index = edge_index_t.detach().cpu().numpy()
+        n_edges = edge_index.shape[1]
+        n_scores = int(errors.shape[0])
+
+        # 3) サイズ不一致を安全に吸収
+        if n_edges != n_scores:
+            print(f"[WARN] mismatch: edges={n_edges}, scores={n_scores} -> truncate")
+        n_use = min(n_edges, n_scores)
+
+        src_ids = edge_index[0, :n_use]
+        dst_ids = edge_index[1, :n_use]
+
+        src_ips = [idx_to_name(int(i)) for i in src_ids]
+        dst_ips = [idx_to_name(int(i)) for i in dst_ids]
+
+        df_flows = pd.DataFrame({
+            "src_ip": src_ips,
+            "dst_ip": dst_ips,
+            "anomaly_score": errors[:n_use].detach().cpu().numpy(),
+        })
+
+        # 4) あれば ts/port/proto を付ける
+        g = dataset.test_graph
+        if hasattr(g, "TIMESTAMP"):
+            ts = g.TIMESTAMP.detach().cpu().numpy()
+            if len(ts) >= n_use:
+                df_flows["ts"] = ts[:n_use]
+        if hasattr(g, "L4_DST_PORT"):
+            dport = g.L4_DST_PORT.detach().cpu().numpy()
+            if len(dport) >= n_use:
+                df_flows["dst_port"] = dport[:n_use]
+        if hasattr(g, "PROTOCOL"):
+            proto = g.PROTOCOL.detach().cpu().numpy()
+            if len(proto) >= n_use:
+                df_flows["proto"] = proto[:n_use]
+
+        # 5) per-flow CSV 出力
+        out_dir = "inference_outputs"
+        os.makedirs(out_dir, exist_ok=True)
+        flow_csv_path = os.path.join(out_dir, f"inference_flows_{run_id}.csv")
+        df_flows.to_csv(flow_csv_path, index=False)
+        print(f"Per-flow scores saved to: {flow_csv_path}")
+
+        # 6) Ranking 実行
+        rank_out_dir = os.path.join(out_dir, f"rankings_{run_id}")
+        print(f"Running IP ranking logic... Output: {rank_out_dir}")
+
+        rank_ips.aggregate_from_df(
+            df=df_flows,
+            ts_col="ts",
+            src_ip_col="src_ip",
+            dst_ip_col="dst_ip",
+            score_col="anomaly_score",
+            dst_port_col="dst_port",
+            proto_col="proto",
+            key_mode="dst_ip",
+            window_sec=3600,
+            method="topk_sum",
+            topk=10,
+            tau=0.0,
+            topn=20,
+            out_dir=rank_out_dir,
+            track_unique_src=True,
+            max_unique_src=10000,
+            emit_global=True
+        )
+
+        global_rank_path = os.path.join(rank_out_dir, "rank_GLOBAL.csv")
+        if os.path.exists(global_rank_path):
+            df_global = pd.read_csv(global_rank_path)
+            run.log({"suspicious_ip_ranking": wandb.Table(dataframe=df_global.head(20))})
+
+    except Exception as e:
+        print(f"Failed to generate IP ranking: {e}")
+        import traceback
+        traceback.print_exc()
+
+
     run.finish()
 
 
@@ -242,6 +427,7 @@ if __name__ == "__main__":
             "positional_encoding": args.positional_encoding,
             "fraction": args.fraction,
         }
+
     if not args.wandb:
         os.environ["WANDB_MODE"] = "offline"
 

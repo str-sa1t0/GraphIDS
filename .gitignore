@@ -11,3 +11,4 @@ outputs
 baselines/SAFE/SAFE.py
 checkpoints
 scalers
+data
