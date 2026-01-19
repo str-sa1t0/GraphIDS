@@ -1,19 +1,19 @@
 import os
 import random
 import warnings
-import pandas as pd
 
 import numpy as np
+import pandas as pd
 import torch
+import wandb
 from sklearn.metrics import precision_recall_curve
 from torch_geometric.loader import LinkNeighborLoader
 
-import wandb
 from models.graphids import GraphIDS
 from utils.dataloaders import NetFlowDataset
-import rank_ips
 from utils.parser import Parser
 from utils.trainers import test, train_encoder
+import rank_ips
 
 # Suppress this warning: even if in prototype stage, it works correctly for our use case
 warnings.filterwarnings(
@@ -105,19 +105,34 @@ def main(run):
         mask_ratio=config.mask_ratio,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(
-        [
-            {  # Higher weight decay for embedding layer
-                "params": model.encoder.parameters(),
-                "weight_decay": config.weight_decay,
-            },
-            {  # Lower weight decay for the transformer
-                "params": model.transformer.parameters(),
+    param_groups = [
+        {  # Higher weight decay for embedding layer
+            "params": model.encoder.parameters(),
+            "weight_decay": config.weight_decay,
+        },
+        {  # Lower weight decay for the transformer
+            "params": model.transformer.parameters(),
+            "weight_decay": config.ae_weight_decay,
+        },
+    ]
+
+    if hasattr(model, "temporal_head"):
+        param_groups.append(
+            {
+                "params": model.temporal_head.parameters(),
                 "weight_decay": config.ae_weight_decay,
-            },
-        ],
-        lr=config.learning_rate,
-    )
+            }
+        )
+
+    if hasattr(model, "proj_head"):
+        param_groups.append(
+            {
+                "params": model.proj_head.parameters(),
+                "weight_decay": config.ae_weight_decay,
+            }
+        )
+
+    optimizer = torch.optim.AdamW(param_groups, lr=config.learning_rate)
 
     checkpoint = config.checkpoint
     if checkpoint is not None and os.path.exists(checkpoint):
@@ -139,6 +154,7 @@ def main(run):
 
     cpu_count = os.cpu_count()
     recommended_workers = min(cpu_count, 6) if cpu_count is not None else 0
+    persistent = True if recommended_workers and recommended_workers > 0 else False
 
     if start_epoch >= config.num_epochs or config.test:
         print("Model already trained")
@@ -151,7 +167,7 @@ def main(run):
             shuffle=False,
             num_workers=recommended_workers,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=persistent,
             drop_last=False,
         )
     else:
@@ -164,7 +180,7 @@ def main(run):
             shuffle=shuffle,
             num_workers=recommended_workers,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=persistent,
             drop_last=True,
         )
         val_loader = LinkNeighborLoader(
@@ -176,7 +192,7 @@ def main(run):
             shuffle=shuffle,
             num_workers=recommended_workers,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=persistent,
             drop_last=True,
         )
         test_loader = LinkNeighborLoader(
@@ -188,7 +204,7 @@ def main(run):
             shuffle=False,
             num_workers=recommended_workers,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=persistent,
             drop_last=False,
         )
 
@@ -265,11 +281,9 @@ def main(run):
         }
     )
 
-
     # --- Post-processing: Suspicious IP Ranking ---
     print("Generating suspicious IP ranking...")
 
-    
     run_id = run.name if getattr(run, "name", None) is not None else (
         run.id if getattr(run, "id", None) is not None else f"seed{config.seed}"
     )
@@ -310,7 +324,6 @@ def main(run):
 
         return str(i)
 
-
     try:
         # 2) エッジ情報を取得
         if hasattr(dataset.test_graph, "edge_label_index") and dataset.test_graph.edge_label_index is not None:
@@ -341,18 +354,18 @@ def main(run):
 
         # 4) あれば ts/port/proto を付ける
         g = dataset.test_graph
-        if hasattr(g, "TIMESTAMP"):
-            ts = g.TIMESTAMP.detach().cpu().numpy()
-            if len(ts) >= n_use:
-                df_flows["ts"] = ts[:n_use]
-        if hasattr(g, "L4_DST_PORT"):
-            dport = g.L4_DST_PORT.detach().cpu().numpy()
-            if len(dport) >= n_use:
-                df_flows["dst_port"] = dport[:n_use]
-        if hasattr(g, "PROTOCOL"):
-            proto = g.PROTOCOL.detach().cpu().numpy()
-            if len(proto) >= n_use:
-                df_flows["proto"] = proto[:n_use]
+
+        ts = _maybe_get_edge_attr_numpy(g, "TIMESTAMP", n_use)
+        if ts is not None:
+            df_flows["ts"] = ts[:n_use]
+
+        dport = _maybe_get_edge_attr_numpy(g, "L4_DST_PORT", n_use)
+        if dport is not None:
+            df_flows["dst_port"] = dport[:n_use]
+
+        proto = _maybe_get_edge_attr_numpy(g, "PROTOCOL", n_use)
+        if proto is not None:
+            df_flows["proto"] = proto[:n_use]
 
         # 5) per-flow CSV 出力
         out_dir = "inference_outputs"
@@ -394,7 +407,6 @@ def main(run):
         print(f"Failed to generate IP ranking: {e}")
         import traceback
         traceback.print_exc()
-
 
     run.finish()
 

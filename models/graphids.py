@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import scatter
+import torch.nn.functional as F
 
 
 class SAGELayer(MessagePassing):
@@ -156,7 +157,7 @@ class TransformerAutoencoder(nn.Module):
             elif "bias" in name:
                 nn.init.zeros_(param)
 
-    def forward(self, src, padding_mask=None):
+    def forward(self, src, padding_mask=None, return_memory: bool = False):
         src = self.input_projection(src)
 
         # Identity function if no positional encoding is used
@@ -194,6 +195,8 @@ class TransformerAutoencoder(nn.Module):
         )
 
         output = self.output_projection(output)
+        if return_memory:
+            return output, memory
         return output
 
 
@@ -242,3 +245,85 @@ class GraphIDS(nn.Module):
         if optimizer and "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         return checkpoint["epoch"], checkpoint["threshold"]
+
+    def _pool_memory(self, memory: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        memory: [B, L, D]
+        padding_mask: (optional) [B, L, input_dim] or [B, L] (True=valid)
+        return: pooled [B, D]
+        """
+        if padding_mask is None:
+            return memory.mean(dim=1)
+
+        # [B, L, input_dim] で来ている場合に [B, L] に落とす
+        if padding_mask.dim() == 3:
+            valid = torch.any(padding_mask.bool(), dim=-1)  # [B, L]
+        else:
+            valid = padding_mask.bool()
+
+        # mean over valid tokens only
+        denom = valid.sum(dim=1, keepdim=True).clamp_min(1)  # [B,1]
+        pooled = (memory * valid.unsqueeze(-1)).sum(dim=1) / denom
+        return pooled
+
+
+    def temporal_pred_loss(self, memory: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        memory: [B, L, D]
+        Predict memory[t+1] from memory[t]
+        """
+        if memory.size(1) < 2:
+            return torch.tensor(0.0, device=memory.device)
+
+        z_t = memory[:, :-1, :]
+        z_tp1 = memory[:, 1:, :]
+
+        z_hat = self.temporal_head(z_t)  # [B, L-1, D]
+
+        if padding_mask is None:
+            return F.mse_loss(z_hat, z_tp1)
+
+        # valid mask for t and t+1
+        if padding_mask.dim() == 3:
+            valid = torch.any(padding_mask.bool(), dim=-1)  # [B, L]
+        else:
+            valid = padding_mask.bool()
+
+        valid_pair = valid[:, 1:] & valid[:, :-1]  # [B, L-1]
+        if valid_pair.sum() == 0:
+            return torch.tensor(0.0, device=memory.device)
+
+        diff = (z_hat - z_tp1).pow(2).mean(dim=-1)  # [B, L-1]
+        return (diff * valid_pair.float()).sum() / valid_pair.float().sum().clamp_min(1)
+
+
+    def contrastive_loss(self, mem_a: torch.Tensor, mem_b: torch.Tensor,
+                        padding_a: torch.Tensor | None = None, padding_b: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        mem_a, mem_b: [B, L, D] from two augmented views
+        """
+        za = self._pool_memory(mem_a, padding_a)  # [B, D]
+        zb = self._pool_memory(mem_b, padding_b)  # [B, D]
+
+        za = F.normalize(self.proj_head(za), dim=-1)
+        zb = F.normalize(self.proj_head(zb), dim=-1)
+
+        logits = (za @ zb.T) / self.contrast_tau  # [B, B]
+        labels = torch.arange(za.size(0), device=za.device)
+        return F.cross_entropy(logits, labels)
+
+
+class MLPHead(nn.Module):
+    def __init__(self, dim_in: int, dim_hidden: int | None = None, dim_out: int | None = None, dropout: float = 0.0):
+        super().__init__()
+        dim_hidden = dim_hidden or dim_in
+        dim_out = dim_out or dim_in
+        self.net = nn.Sequential(
+            nn.Linear(dim_in, dim_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_hidden, dim_out),
+        )
+
+    def forward(self, x):
+        return self.net(x)
