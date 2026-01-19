@@ -474,7 +474,7 @@ def aggregate_non_stream(
 
     # per-window ranking
     for ws, gws in df.groupby("__ws"):
-        scores = gws.groupby("__key", sort=False).apply(score_group)
+        scores = gws.groupby("__key", sort=False).apply(score_group, include_groups=False)
         counts = gws.groupby("__key", sort=False).size()
         if track_unique_src:
             nunique = gws.groupby("__key", sort=False)[src_ip_col].nunique()
@@ -497,7 +497,7 @@ def aggregate_non_stream(
                 ])
 
     if emit_global:
-        scores = df.groupby("__key", sort=False).apply(score_group).sort_values(ascending=False).head(topn)
+        scores = df.groupby("__key", sort=False).apply(score_group, include_groups=False).sort_values(ascending=False).head(topn)
         counts = df.groupby("__key", sort=False).size()
         if track_unique_src:
             nunique = df.groupby("__key", sort=False)[src_ip_col].nunique()
