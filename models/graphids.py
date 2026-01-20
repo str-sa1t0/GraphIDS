@@ -1,3 +1,4 @@
+# models/graphids.py
 import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
@@ -9,60 +10,47 @@ class SAGELayer(MessagePassing):
     def __init__(self, ndim_in, edim_in, edim_out, agg_type="mean", dropout_rate=0.0):
         super().__init__(aggr=agg_type)
         self.fc_neigh = nn.Linear(edim_in, ndim_in)
+        # ★ 追加：node feature を注入するための線形層
+        self.fc_node = nn.Linear(ndim_in, ndim_in)
+
         self.fc_edge = nn.Linear(ndim_in * 2, edim_out)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout_rate)
-        self.agg_type : str = agg_type
+        self.agg_type: str = agg_type
         self.reset_parameters()
 
     def reset_parameters(self):
         gain = nn.init.calculate_gain("relu")
         nn.init.xavier_normal_(self.fc_neigh.weight, gain=gain)
+        nn.init.xavier_normal_(self.fc_node.weight, gain=gain)
         nn.init.xavier_normal_(self.fc_edge.weight, gain=gain)
 
+        nn.init.zeros_(self.fc_neigh.bias)
+        nn.init.zeros_(self.fc_node.bias)
+        nn.init.zeros_(self.fc_edge.bias)
+
     def message(self, edge_attr):  # type: ignore[override]
-        """
-        Copy edge features as messages.
-        DGL equivalent: fn.copy_e("h", "m")
-        """
         return edge_attr
 
     def aggregate(self, inputs, index, ptr=None, dim_size=None):
+        return scatter(inputs, index, dim=self.node_dim, dim_size=dim_size, reduce="mean")
+
+    # ★ node_attr を受け取れるようにする（後方互換）
+    def forward(self, edge_index, edge_attr, edge_couples, num_nodes, node_attr=None):
         """
-        Aggregate edge features to destination nodes using mean aggregation.
-        DGL equivalent: fn.mean("m", "h_neigh")
+        node_attr: [num_nodes, ndim_in] (optional)
         """
-        return scatter(
-            inputs, index, dim=self.node_dim, dim_size=dim_size, reduce="mean"
-        )
+        # Aggregate edge features to nodes
+        node_msg = self.propagate(edge_index, edge_attr=edge_attr, size=(num_nodes, num_nodes))  # [N, edim_in]
+        node_msg = self.fc_neigh(node_msg)  # [N, ndim_in]
 
-    def forward(self, edge_index, edge_attr, edge_couples, num_nodes):
-        """
-        Aggregate edge features to nodes, then compute edge embeddings.
+        # ★ node feature injection
+        if node_attr is not None:
+            # node_attr is [N, ndim_in]
+            node_msg = node_msg + self.fc_node(node_attr)
 
-        Args:
-            edge_index: Edge connectivity [2, num_edges]
-            edge_attr: Edge features [num_edges, edim_in] - the actual input data
-            edge_couples: Target edge pairs [batch_size, 2] - edges to embed
-            num_nodes: Number of nodes in the graph
+        node_embeddings = self.relu(node_msg)
 
-        Returns:
-            edge_embeddings: [batch_size, edim_out] - final edge representations
-
-        Process:
-            1. Aggregate edge features to nodes (mean of incoming edges)
-            2. Transform aggregated features: fc_neigh + ReLU
-            3. For target edges: concat source & dest node embeddings
-            4. Project to final edge embeddings: fc_edge + dropout
-        """
-        # Aggregate edge features to nodes (DGL: fn.copy_e + fn.mean)
-        node_embeddings = self.propagate(  # type: ignore
-            edge_index, edge_attr=edge_attr, size=(num_nodes, num_nodes)
-        )
-        # Transform aggregated features and activate
-        node_embeddings = self.relu(self.fc_neigh(node_embeddings))
-
-        # Compute edge embeddings from concatenated source and destination node embeddings
         edge_embeddings = self.fc_edge(
             torch.cat(
                 [
@@ -88,7 +76,6 @@ class LearnablePositionalEncoding(nn.Module):
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, embed_dim, max_len=512):
         super().__init__()
-
         pe = torch.zeros(max_len, embed_dim)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(
@@ -117,25 +104,25 @@ class TransformerAutoencoder(nn.Module):
     ):
         super().__init__()
         if positional_encoding == "learnable":
-            self.positional_encoder = LearnablePositionalEncoding(
-                embed_dim, window_size
-            )
+            self.positional_encoder = LearnablePositionalEncoding(embed_dim, window_size)
         elif positional_encoding == "sinusoidal":
-            self.positional_encoder = SinusoidalPositionalEncoding(
-                embed_dim, window_size
-            )
+            self.positional_encoder = SinusoidalPositionalEncoding(embed_dim, window_size)
         else:
             self.positional_encoder = nn.Identity()
+
         self.input_projection = nn.Linear(input_dim, embed_dim)
         self.mask_ratio = mask_ratio
+
         self.encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=num_heads, dropout=dropout, batch_first=True
         )
         self.encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers)
+
         self.decoder_layer = nn.TransformerDecoderLayer(
             d_model=embed_dim, nhead=num_heads, dropout=dropout, batch_first=True
         )
         self.decoder = nn.TransformerDecoder(self.decoder_layer, num_layers=num_layers)
+
         self.output_projection = nn.Linear(embed_dim, input_dim)
         self._initialize_weights()
 
@@ -159,8 +146,6 @@ class TransformerAutoencoder(nn.Module):
 
     def forward(self, src, padding_mask=None, return_memory: bool = False):
         src = self.input_projection(src)
-
-        # Identity function if no positional encoding is used
         src = self.positional_encoder(src)
 
         src_key_padding_mask = None
@@ -175,16 +160,12 @@ class TransformerAutoencoder(nn.Module):
                 torch.ones(seq_len, seq_len, device=src.device, dtype=torch.bool),
                 diagonal=1,
             )
-            mask = mask & (
-                torch.rand(seq_len, seq_len, device=src.device) < self.mask_ratio
-            )
+            mask = mask & (torch.rand(seq_len, seq_len, device=src.device) < self.mask_ratio)
             attention_mask = mask | mask.T
         else:
             attention_mask = None
 
-        memory = self.encoder(
-            src, mask=attention_mask, src_key_padding_mask=src_key_padding_mask
-        )
+        memory = self.encoder(src, mask=attention_mask, src_key_padding_mask=src_key_padding_mask)
 
         output = self.decoder(
             src,
@@ -215,6 +196,8 @@ class GraphIDS(nn.Module):
         positional_encoding=None,
         agg_type="mean",
         mask_ratio=0.15,
+        # ★ SSLの温度（contrastive）
+        contrast_tau: float = 0.2,
     ):
         super().__init__()
         self.encoder = SAGELayer(ndim_in, edim_in, edim_out, agg_type, dropout)
@@ -228,6 +211,19 @@ class GraphIDS(nn.Module):
             positional_encoding,
             mask_ratio,
         )
+
+        # ★ 追加：Temporal / Contrastive head
+        self.temporal_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.proj_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.contrast_tau = float(contrast_tau)
 
     def save_checkpoint(self, path, optimizer=None, epoch=0, threshold=None):
         checkpoint = {
@@ -247,83 +243,54 @@ class GraphIDS(nn.Module):
         return checkpoint["epoch"], checkpoint["threshold"]
 
     def _pool_memory(self, memory: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        memory: [B, L, D]
-        padding_mask: (optional) [B, L, input_dim] or [B, L] (True=valid)
-        return: pooled [B, D]
-        """
         if padding_mask is None:
             return memory.mean(dim=1)
 
-        # [B, L, input_dim] で来ている場合に [B, L] に落とす
         if padding_mask.dim() == 3:
             valid = torch.any(padding_mask.bool(), dim=-1)  # [B, L]
         else:
             valid = padding_mask.bool()
 
-        # mean over valid tokens only
-        denom = valid.sum(dim=1, keepdim=True).clamp_min(1)  # [B,1]
+        denom = valid.sum(dim=1, keepdim=True).clamp_min(1)
         pooled = (memory * valid.unsqueeze(-1)).sum(dim=1) / denom
         return pooled
 
-
     def temporal_pred_loss(self, memory: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        memory: [B, L, D]
-        Predict memory[t+1] from memory[t]
-        """
         if memory.size(1) < 2:
             return torch.tensor(0.0, device=memory.device)
 
         z_t = memory[:, :-1, :]
         z_tp1 = memory[:, 1:, :]
-
-        z_hat = self.temporal_head(z_t)  # [B, L-1, D]
+        z_hat = self.temporal_head(z_t)
 
         if padding_mask is None:
             return F.mse_loss(z_hat, z_tp1)
 
-        # valid mask for t and t+1
         if padding_mask.dim() == 3:
-            valid = torch.any(padding_mask.bool(), dim=-1)  # [B, L]
+            valid = torch.any(padding_mask.bool(), dim=-1)
         else:
             valid = padding_mask.bool()
 
-        valid_pair = valid[:, 1:] & valid[:, :-1]  # [B, L-1]
+        valid_pair = valid[:, 1:] & valid[:, :-1]
         if valid_pair.sum() == 0:
             return torch.tensor(0.0, device=memory.device)
 
-        diff = (z_hat - z_tp1).pow(2).mean(dim=-1)  # [B, L-1]
+        diff = (z_hat - z_tp1).pow(2).mean(dim=-1)
         return (diff * valid_pair.float()).sum() / valid_pair.float().sum().clamp_min(1)
 
-
-    def contrastive_loss(self, mem_a: torch.Tensor, mem_b: torch.Tensor,
-                        padding_a: torch.Tensor | None = None, padding_b: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        mem_a, mem_b: [B, L, D] from two augmented views
-        """
-        za = self._pool_memory(mem_a, padding_a)  # [B, D]
-        zb = self._pool_memory(mem_b, padding_b)  # [B, D]
+    def contrastive_loss(
+        self,
+        mem_a: torch.Tensor,
+        mem_b: torch.Tensor,
+        padding_a: torch.Tensor | None = None,
+        padding_b: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        za = self._pool_memory(mem_a, padding_a)
+        zb = self._pool_memory(mem_b, padding_b)
 
         za = F.normalize(self.proj_head(za), dim=-1)
         zb = F.normalize(self.proj_head(zb), dim=-1)
 
-        logits = (za @ zb.T) / self.contrast_tau  # [B, B]
+        logits = (za @ zb.T) / self.contrast_tau
         labels = torch.arange(za.size(0), device=za.device)
         return F.cross_entropy(logits, labels)
-
-
-class MLPHead(nn.Module):
-    def __init__(self, dim_in: int, dim_hidden: int | None = None, dim_out: int | None = None, dropout: float = 0.0):
-        super().__init__()
-        dim_hidden = dim_hidden or dim_in
-        dim_out = dim_out or dim_in
-        self.net = nn.Sequential(
-            nn.Linear(dim_in, dim_hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_hidden, dim_out),
-        )
-
-    def forward(self, x):
-        return self.net(x)

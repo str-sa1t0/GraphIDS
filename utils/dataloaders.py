@@ -1,3 +1,4 @@
+# utils/dataloaders.py
 import os
 import pickle
 import shutil
@@ -12,6 +13,7 @@ from sklearn.preprocessing import MinMaxScaler
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset as TorchDataset
 from torch_geometric.data import Data
+from torch_geometric.utils import degree
 
 torch.serialization.add_safe_globals(
     [
@@ -22,6 +24,9 @@ torch.serialization.add_safe_globals(
 )
 
 
+# -----------------------------
+# Collate / Sequential Dataset
+# -----------------------------
 def collate_fn(batch):
     sequences, masks = zip(*batch, strict=False)
     sequences_padded = pad_sequence(sequences, batch_first=True, padding_value=0)
@@ -47,8 +52,13 @@ class SequentialDataset(TorchDataset):
         return max(0, (len(self.data) - 1) // self.step + 1)
 
 
+# -----------------------------
+# Utilities
+# -----------------------------
 def _node_to_display_str(v) -> str:
-
+    """
+    node id / ip表現の復元（IPv4整数っぽい場合は dotted に変換）
+    """
     s = str(v)
     if "." in s:
         return s
@@ -56,13 +66,76 @@ def _node_to_display_str(v) -> str:
         iv = int(float(v))
         if (2**24) <= iv <= (2**32 - 1):
             import ipaddress
+
             return str(ipaddress.IPv4Address(iv))
     except Exception:
         pass
-
     return s
 
 
+def _compute_struct_node_features(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    """
+    Graph structure based node features for "infrastructure-likeness".
+
+    Return: [N, 5]
+      [ log1p(deg_in), log1p(deg_out), log1p(uniq_in), log1p(uniq_out), log1p(kcore) ]
+
+    - deg_in/out: multi-edge degree (directed)
+    - uniq_in/out: unique neighbor count (directed)
+    - kcore: undirected core number (optional, networkx)
+    """
+    # Ensure CPU
+    if edge_index.is_cuda:
+        edge_index = edge_index.detach().cpu()
+
+    src = edge_index[0]
+    dst = edge_index[1]
+
+    # Multi-edge degree
+    deg_out = degree(src, num_nodes=num_nodes).to(torch.float32)
+    deg_in = degree(dst, num_nodes=num_nodes).to(torch.float32)
+
+    # Unique neighbors: unique (src,dst)
+    pairs = torch.stack([src, dst], dim=1)  # [E,2]
+    uniq_pairs = torch.unique(pairs, dim=0)
+    uniq_src = uniq_pairs[:, 0]
+    uniq_dst = uniq_pairs[:, 1]
+
+    uniq_out = degree(uniq_src, num_nodes=num_nodes).to(torch.float32)
+    uniq_in = degree(uniq_dst, num_nodes=num_nodes).to(torch.float32)
+
+    # k-core (undirected)
+    kcore = torch.zeros(num_nodes, dtype=torch.float32)
+    try:
+        import networkx as nx
+
+        s = src.numpy()
+        d = dst.numpy()
+        G = nx.Graph()
+        G.add_nodes_from(range(num_nodes))
+        G.add_edges_from(zip(s, d))
+        core = nx.core_number(G)
+        for n, k in core.items():
+            if 0 <= int(n) < num_nodes:
+                kcore[int(n)] = float(k)
+    except Exception:
+        # networkx 未導入 or 失敗時はゼロでOK（モデルは他の特徴で動く）
+        pass
+
+    # Stabilize scale
+    deg_in = torch.log1p(deg_in)
+    deg_out = torch.log1p(deg_out)
+    uniq_in = torch.log1p(uniq_in)
+    uniq_out = torch.log1p(uniq_out)
+    kcore = torch.log1p(kcore)
+
+    extra = torch.stack([deg_in, deg_out, uniq_in, uniq_out, kcore], dim=1)  # [N,5]
+    return extra
+
+
+# -----------------------------
+# Dataset
+# -----------------------------
 class NetFlowDataset:
     def __init__(
         self,
@@ -110,7 +183,7 @@ class NetFlowDataset:
         self.val_graph = torch.load(os.path.join(self.processed_dir, "val.pt"))[0]
         self.test_graph = torch.load(os.path.join(self.processed_dir, "test.pt"))[0]
 
-        # ★ ここが重要：node_id -> 元IP の mapping をロード
+        # node_id -> 元IP mapping
         self.mapping: Optional[List[str]] = None
         mapping_path = os.path.join(self.processed_dir, "node_mapping.pkl")
         if os.path.exists(mapping_path):
@@ -138,7 +211,7 @@ class NetFlowDataset:
         if self.fraction is not None:
             df = df.groupby(by="Attack").sample(frac=self.fraction, random_state=self.seed)
 
-        # ★ ランキング用に raw メタ情報を保持（スケーリングされない列として退避）
+        # raw meta columns (keep unscaled)
         for col in ["FLOW_START_MILLISECONDS", "FLOW_END_MILLISECONDS", "L4_DST_PORT", "PROTOCOL"]:
             if col in df.columns:
                 df[col + "_RAW"] = df[col]
@@ -149,10 +222,12 @@ class NetFlowDataset:
         x = x.replace([np.inf, -np.inf], np.nan)
         x = x.fillna(0)
 
+        # edge feature selection
         if "v3" in self.name:
             edge_features = [
                 col for col in x.columns
-                if col not in [
+                if col
+                not in [
                     "IPV4_SRC_ADDR",
                     "IPV4_DST_ADDR",
                     "FLOW_END_MILLISECONDS",
@@ -160,10 +235,7 @@ class NetFlowDataset:
                 ]
             ]
         else:
-            edge_features = [
-                col for col in x.columns
-                if col not in ["IPV4_SRC_ADDR", "IPV4_DST_ADDR"]
-            ]
+            edge_features = [col for col in x.columns if col not in ["IPV4_SRC_ADDR", "IPV4_DST_ADDR"]]
 
         df = pd.concat([x, y], axis=1)
 
@@ -174,6 +246,7 @@ class NetFlowDataset:
         if self.data_type == "benign":
             df_train = df_train[df_train["Label"] == 0]
 
+        # scaler fit on train only
         scaler_path = os.path.join("scalers", f"scaler_{self.name}.pkl")
         if os.path.exists(scaler_path):
             try:
@@ -190,6 +263,7 @@ class NetFlowDataset:
             with open(scaler_path, "wb") as f:
                 pickle.dump(scaler, f)
 
+        # scale train/val/test
         df_train[edge_features] = scaler.transform(df_train[edge_features])
 
         df_val_test_scaled = scaler.transform(df_val_test[edge_features])
@@ -202,12 +276,13 @@ class NetFlowDataset:
             stratify=df_val_test["Attack"],
         )
 
+        # time sorting for v3
         if "v3" in self.name and "FLOW_START_MILLISECONDS" in df_train.columns:
             df_train = df_train.sort_values(by="FLOW_START_MILLISECONDS")
             df_val = df_val.sort_values(by="FLOW_START_MILLISECONDS")
             df_test = df_test.sort_values(by="FLOW_START_MILLISECONDS")
 
-        # ★ ノード集合→ node_id 付与
+        # build node set from all splits
         unique_nodes = pd.concat(
             [
                 df_train["IPV4_SRC_ADDR"],
@@ -223,12 +298,32 @@ class NetFlowDataset:
         node_map = {node: i for i, node in enumerate(unique_nodes)}
         num_nodes = len(node_map)
 
-        # ★ 逆引き mapping（idx -> 元IP文字列）を作成＆保存
+        # node_mapping.pkl save
         mapping = [_node_to_display_str(v) for v in unique_nodes]
         mapping_path = os.path.join(self.processed_dir, "node_mapping.pkl")
         with open(mapping_path, "wb") as f:
             pickle.dump(mapping, f)
         print(f"[OK] saved node mapping: {mapping_path} (size={len(mapping)})")
+
+        # -----------------------------
+        # ★ Global structural node features (k-core / degree / unique-neighbor)
+        #   We compute from ALL flows so that train/val/test node feature is consistent.
+        # -----------------------------
+        df_all = pd.concat([df_train, df_val, df_test], axis=0, ignore_index=True)
+
+        all_src = np.array([node_map[ip] for ip in df_all["IPV4_SRC_ADDR"]], dtype=np.int64)
+        all_dst = np.array([node_map[ip] for ip in df_all["IPV4_DST_ADDR"]], dtype=np.int64)
+        edge_index_all = torch.tensor(np.array([all_src, all_dst]), dtype=torch.long)
+
+        extra_struct = _compute_struct_node_features(edge_index_all, num_nodes)  # [N,5]
+
+        # baseline node features (keep original behavior)
+        # NOTE: original GraphIDS used x with same dim as edge feature dim
+        baseline_dim = len(edge_features)
+        x_node_base = torch.ones(num_nodes, baseline_dim, dtype=torch.float32)
+
+        # final node features
+        x_node_global = torch.cat([x_node_base, extra_struct], dim=1)  # [N, baseline_dim+5]
 
         datasets = {"train": df_train, "val": df_val, "test": df_test}
 
@@ -237,23 +332,22 @@ class NetFlowDataset:
             dst_nodes = np.array([node_map[ip] for ip in df_split["IPV4_DST_ADDR"]], dtype=np.int64)
 
             edge_index = torch.tensor(np.array([src_nodes, dst_nodes]), dtype=torch.long)
-            edge_attr = torch.tensor(df_split[edge_features].values, dtype=torch.float)
+            edge_attr = torch.tensor(df_split[edge_features].values, dtype=torch.float32)
             edge_labels = torch.tensor(df_split["Label"].values, dtype=torch.long)
 
-            # GraphIDSの実装に合わせて node feature は1固定
-            x_node = torch.ones(num_nodes, edge_attr.shape[1], dtype=torch.float)
-
+            # ★ Use global node features (consistent across splits)
             data = Data(
-                x=x_node,
+                x=x_node_global.clone(),
                 edge_index=edge_index,
                 edge_attr=edge_attr,
                 edge_labels=edge_labels,
                 num_nodes=num_nodes,
             )
 
-            # ★ 元の raw メタ情報を data に追加保存
+            # raw meta attributes
             if "FLOW_START_MILLISECONDS_RAW" in df_split.columns:
                 ts_ms = df_split["FLOW_START_MILLISECONDS_RAW"].fillna(0).astype(np.int64).to_numpy()
+                # keep same behavior as your main.py expects (int->ns)
                 data.TIMESTAMP = torch.tensor(ts_ms * 1_000_000, dtype=torch.long)
 
             if "L4_DST_PORT_RAW" in df_split.columns:

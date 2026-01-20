@@ -1,709 +1,670 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Rank suspicious IPs/endpoints from per-flow anomaly scores.
-
-Typical pipeline:
-  1) GraphIDS inference -> per-flow CSV with columns:
-       ts, src_ip, dst_ip, anomaly_score, (optional) dst_port, proto
-  2) This script aggregates anomaly_score per key (dst_ip or endpoint) per time window,
-     then outputs top-N suspicious keys.
-
-Assumptions for streaming mode:
-  - Input is sorted by ts ascending (recommended). If not, use --no_stream (loads all).
-
-Scoring methods:
-  - topk_sum: sum of top-k anomaly scores per key in a window
-  - exceed_sum: sum(max(0, score - tau)) per key in a window
-  - mean: mean(score) per key in a window
-  - max: max(score) per key in a window
-"""
-
+# rank_ips.py
 from __future__ import annotations
 
-import argparse
-import csv
-import heapq
-import math
 import os
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Any
+import json
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Tuple, List
+
 import numpy as np
-try:
-    import pandas as pd
-except ImportError as e:
-    raise SystemExit("pandas is required. pip install pandas") from e
+import pandas as pd
 
 
-def parse_ts(x: Any) -> datetime:
+# ============================================================
+# Utilities
+# ============================================================
+def _ensure_datetime_series(s: pd.Series) -> pd.Series:
     """
-    Parse timestamp field to timezone-aware datetime (UTC).
-    Accepts ISO8601 strings, unix seconds, pandas Timestamp, datetime.
+    Convert ts column to pandas datetime.
+
+    Expected:
+      - already datetime64
+      - int/float epoch time (ns/us/ms/s)
+
+    Your NetFlowDataset currently stores:
+      data.TIMESTAMP = FLOW_START_MILLISECONDS_RAW * 1_000_000  (ns)
     """
-    if x is None or (isinstance(x, float) and math.isnan(x)):
-        raise ValueError("ts is null")
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s
 
-    if isinstance(x, datetime):
-        dt = x
-    else:
-        dt = pd.to_datetime(x, utc=True, errors="raise").to_pydatetime()
+    # try numeric epoch -> datetime
+    if pd.api.types.is_numeric_dtype(s):
+        x = s.fillna(0).astype(np.int64)
 
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt
+        # heuristic based on magnitude
+        vmax = int(x.max()) if len(x) > 0 else 0
 
-
-def floor_time(dt: datetime, window: timedelta) -> datetime:
-    """
-    Floor dt to window boundary (UTC).
-    """
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    seconds = int((dt - epoch).total_seconds())
-    w = int(window.total_seconds())
-    floored = (seconds // w) * w
-    return epoch + timedelta(seconds=floored)
-
-
-# -----------------------------
-# Score accumulators
-# -----------------------------
-class Accumulator:
-    def update(self, score: float, src_ip: Optional[str] = None) -> None:
-        raise NotImplementedError
-
-    def value(self) -> float:
-        raise NotImplementedError
-
-    def count(self) -> int:
-        raise NotImplementedError
-
-    def src_nunique(self) -> Optional[int]:
-        return None
-
-
-class TopKSum(Accumulator):
-    def __init__(self, k: int, track_unique_src: bool = False, max_unique_src: int = 50000) -> None:
-        self.k = max(1, k)
-        self.heap: List[float] = []  # min-heap size<=k
-        self._count = 0
-        self._sum_topk = 0.0
-        self._track_unique_src = track_unique_src
-        self._src_set = set() if track_unique_src else None
-        self._max_unique_src = max_unique_src
-
-    def update(self, score: float, src_ip: Optional[str] = None) -> None:
-        self._count += 1
-
-        # update top-k heap + sum in O(log k)
-        if len(self.heap) < self.k:
-            heapq.heappush(self.heap, score)
-            self._sum_topk += score
+        # ns epoch ~ 1e18, us epoch ~ 1e15, ms epoch ~ 1e12, sec epoch ~ 1e9
+        if vmax >= 10**17:
+            unit = "ns"
+        elif vmax >= 10**14:
+            unit = "us"
+        elif vmax >= 10**11:
+            unit = "ms"
         else:
-            if score > self.heap[0]:
-                smallest = heapq.heapreplace(self.heap, score)
-                self._sum_topk += (score - smallest)
+            unit = "s"
 
-        if self._track_unique_src and src_ip is not None and self._src_set is not None:
-            # cap to avoid unbounded memory
-            if len(self._src_set) < self._max_unique_src:
-                self._src_set.add(src_ip)
+        return pd.to_datetime(x, unit=unit, errors="coerce")
 
-    def value(self) -> float:
-        return float(self._sum_topk)
-
-    def count(self) -> int:
-        return self._count
-
-    def src_nunique(self) -> Optional[int]:
-        if self._src_set is None:
-            return None
-        return len(self._src_set)
+    # fallback string parse
+    return pd.to_datetime(s, errors="coerce")
 
 
-class ExceedSum(Accumulator):
-    def __init__(self, tau: float, track_unique_src: bool = False, max_unique_src: int = 50000) -> None:
-        self.tau = float(tau)
-        self._sum = 0.0
-        self._count = 0
-        self._track_unique_src = track_unique_src
-        self._src_set = set() if track_unique_src else None
-        self._max_unique_src = max_unique_src
-
-    def update(self, score: float, src_ip: Optional[str] = None) -> None:
-        self._count += 1
-        if score > self.tau:
-            self._sum += (score - self.tau)
-
-        if self._track_unique_src and src_ip is not None and self._src_set is not None:
-            if len(self._src_set) < self._max_unique_src:
-                self._src_set.add(src_ip)
-
-    def value(self) -> float:
-        return float(self._sum)
-
-    def count(self) -> int:
-        return self._count
-
-    def src_nunique(self) -> Optional[int]:
-        if self._src_set is None:
-            return None
-        return len(self._src_set)
+def _safe_mkdir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
 
-class Mean(Accumulator):
-    def __init__(self, track_unique_src: bool = False, max_unique_src: int = 50000) -> None:
-        self._sum = 0.0
-        self._count = 0
-        self._track_unique_src = track_unique_src
-        self._src_set = set() if track_unique_src else None
-        self._max_unique_src = max_unique_src
-
-    def update(self, score: float, src_ip: Optional[str] = None) -> None:
-        self._count += 1
-        self._sum += score
-
-        if self._track_unique_src and src_ip is not None and self._src_set is not None:
-            if len(self._src_set) < self._max_unique_src:
-                self._src_set.add(src_ip)
-
-    def value(self) -> float:
-        return float(self._sum / self._count) if self._count else 0.0
-
-    def count(self) -> int:
-        return self._count
-
-    def src_nunique(self) -> Optional[int]:
-        if self._src_set is None:
-            return None
-        return len(self._src_set)
+def _maybe_filter_tau(df: pd.DataFrame, score_col: str, tau: float) -> pd.DataFrame:
+    if tau is None:
+        return df
+    try:
+        tau = float(tau)
+    except Exception:
+        return df
+    if tau <= 0:
+        return df
+    return df[df[score_col] >= tau]
 
 
-class Max(Accumulator):
-    def __init__(self, track_unique_src: bool = False, max_unique_src: int = 50000) -> None:
-        self._max = float("-inf")
-        self._count = 0
-        self._track_unique_src = track_unique_src
-        self._src_set = set() if track_unique_src else None
-        self._max_unique_src = max_unique_src
-
-    def update(self, score: float, src_ip: Optional[str] = None) -> None:
-        self._count += 1
-        if score > self._max:
-            self._max = score
-
-        if self._track_unique_src and src_ip is not None and self._src_set is not None:
-            if len(self._src_set) < self._max_unique_src:
-                self._src_set.add(src_ip)
-
-    def value(self) -> float:
-        return float(self._max) if self._count else 0.0
-
-    def count(self) -> int:
-        return self._count
-
-    def src_nunique(self) -> Optional[int]:
-        if self._src_set is None:
-            return None
-        return len(self._src_set)
-
-
-# -----------------------------
-# Aggregation core
-# -----------------------------
-@dataclass
-class WindowResult:
-    window_start: datetime
-    window_end: datetime
-    rows: List[Dict[str, Any]]
-
-
-def make_key(
-    row: Dict[str, Any],
-    mode: str,
-    dst_ip_col: str,
-    dst_port_col: str,
-    proto_col: str,
-) -> str:
-    if mode == "dst_ip":
-        return str(row[dst_ip_col])
-    if mode == "endpoint":
-        dip = str(row[dst_ip_col])
-        dport = str(row.get(dst_port_col, ""))
-        proto = str(row.get(proto_col, ""))
-        return f"{dip}:{dport}:{proto}"
-    raise ValueError(f"Unknown key_mode={mode}")
-
-
-def create_accumulator(
-    method: str,
-    topk: int,
-    tau: float,
-    track_unique_src: bool,
-    max_unique_src: int,
-) -> Accumulator:
-    if method == "topk_sum":
-        return TopKSum(k=topk, track_unique_src=track_unique_src, max_unique_src=max_unique_src)
-    if method == "exceed_sum":
-        return ExceedSum(tau=tau, track_unique_src=track_unique_src, max_unique_src=max_unique_src)
-    if method == "mean":
-        return Mean(track_unique_src=track_unique_src, max_unique_src=max_unique_src)
-    if method == "max":
-        return Max(track_unique_src=track_unique_src, max_unique_src=max_unique_src)
-    raise ValueError(f"Unknown method={method}")
-
-
-def dump_window_csv(
-    out_path: str,
-    window_start: datetime,
-    window_end: datetime,
-    key_name: str,
-    top_rows: List[Tuple[str, Accumulator]],
-) -> None:
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["window_start_utc", "window_end_utc", key_name, "score", "flow_count", "src_ip_nunique"])
-        for key, acc in top_rows:
-            w.writerow([
-                window_start.isoformat(),
-                window_end.isoformat(),
-                key,
-                f"{acc.value():.10g}",
-                acc.count(),
-                "" if acc.src_nunique() is None else acc.src_nunique(),
-            ])
-
-
-def top_n_from_map(
-    m: Dict[str, Accumulator],
-    n: int
-) -> List[Tuple[str, Accumulator]]:
-    # sort descending by score
-    return sorted(m.items(), key=lambda kv: kv[1].value(), reverse=True)[:n]
-
-
-# -----------------------------
-# Readers
-# -----------------------------
-def iter_rows_csv(
-    path: str,
-    usecols: List[str],
-    chunksize: int,
-) -> Iterator[Dict[str, Any]]:
-    for chunk in pd.read_csv(path, usecols=usecols, chunksize=chunksize):
-        # ensure dict per row
-        for r in chunk.to_dict(orient="records"):
-            yield r
-
-
-def iter_rows_parquet(
-    path: str,
-    usecols: List[str],
-    chunksize: int,
-) -> Iterator[Dict[str, Any]]:
-    # pandas read_parquet has no chunksize; fallback: load all
-    df = pd.read_parquet(path, columns=usecols)
-    for r in df.to_dict(orient="records"):
-        yield r
-
-
-# -----------------------------
-# Main aggregation
-# -----------------------------
-def aggregate_streaming(
-    input_path: str,
-    input_format: str,
-    ts_col: str,
-    src_ip_col: str,
-    dst_ip_col: str,
+def _topk_sum_group(
+    g: pd.DataFrame,
     score_col: str,
-    dst_port_col: str,
-    proto_col: str,
-    key_mode: str,
-    window_sec: int,
-    method: str,
     topk: int,
-    tau: float,
-    topn: int,
-    chunksize: int,
-    out_dir: str,
-    track_unique_src: bool,
-    max_unique_src: int,
-    emit_global: bool,
-) -> None:
-    window = timedelta(seconds=window_sec)
+    src_ip_col: Optional[str] = None,
+    track_unique_src: bool = False,
+    max_unique_src: int = 10000,
+) -> Dict[str, Any]:
+    """
+    Score a group (one key e.g., one dst_ip) by summing top-k flow anomaly scores.
 
-    # choose columns
-    usecols = [ts_col, src_ip_col, dst_ip_col, score_col]
-    if key_mode == "endpoint":
-        # may not exist; row.get handles missing
-        usecols += [dst_port_col, proto_col]
-    usecols = list(dict.fromkeys(usecols))  # de-dup
+    Returns:
+      score, n_flows, topk, unique_src(optional)
+    """
+    if g.empty:
+        out = {"score": 0.0, "n_flows": 0}
+        if track_unique_src:
+            out["unique_src"] = 0
+        return out
 
-    # row iterator
-    if input_format == "csv":
-        it = iter_rows_csv(input_path, usecols=usecols, chunksize=chunksize)
-    elif input_format == "parquet":
-        it = iter_rows_parquet(input_path, usecols=usecols, chunksize=chunksize)
-    else:
-        raise ValueError("input_format must be csv or parquet")
+    # top-k by score
+    if topk is None or topk <= 0:
+        topk = len(g)
 
-    current_ws: Optional[datetime] = None
-    current_we: Optional[datetime] = None
-    acc_map: Dict[str, Accumulator] = {}
-    global_map: Dict[str, Accumulator] = {} if emit_global else {}
+    g2 = g.nlargest(min(topk, len(g)), columns=score_col)
 
-    def flush_window(ws: datetime, we: datetime) -> None:
-        if not acc_map:
-            return
-        top_rows = top_n_from_map(acc_map, topn)
-        fname = f"rank_{ws.strftime('%Y%m%dT%H%M%SZ')}_{we.strftime('%Y%m%dT%H%M%SZ')}.csv"
-        out_path = os.path.join(out_dir, fname)
-        key_name = "dst_ip" if key_mode == "dst_ip" else "endpoint"
-        dump_window_csv(out_path, ws, we, key_name, top_rows)
-        acc_map.clear()
+    score = float(g2[score_col].sum())
+    out = {
+        "score": score,
+        "n_flows": int(len(g)),
+        "topk_used": int(len(g2)),
+    }
 
-    for row in it:
-        dt = parse_ts(row[ts_col])
-        ws = floor_time(dt, window)
-        we = ws + window
+    if track_unique_src and src_ip_col is not None and src_ip_col in g2.columns:
+        # cap to avoid memory blow-up
+        if len(g2) > max_unique_src:
+            out["unique_src"] = int(g2[src_ip_col].iloc[:max_unique_src].nunique())
+        else:
+            out["unique_src"] = int(g2[src_ip_col].nunique())
 
-        if current_ws is None:
-            current_ws, current_we = ws, we
+    return out
 
-        # If window advanced, flush until we catch up.
-        # Assumes sorted by ts; if gaps, it will just flush once and move.
-        if ws != current_ws:
-            flush_window(current_ws, current_we)  # type: ignore[arg-type]
-            current_ws, current_we = ws, we
 
-        key = make_key(row, key_mode, dst_ip_col, dst_port_col, proto_col)
-        try:
-            score = float(row[score_col])
-        except Exception:
+# ============================================================
+# PPR + anomaly + pairwise (depth proxy via k-core)
+# ============================================================
+def _build_node_index_from_ips(all_ips: List[str]) -> Tuple[Dict[str, int], List[str]]:
+    uniq = sorted(set(map(str, all_ips)))
+    ip2i = {ip: i for i, ip in enumerate(uniq)}
+    return ip2i, uniq
+
+
+def _ppr_power_iteration(
+    edges: List[Tuple[int, int]],
+    num_nodes: int,
+    seeds: List[int],
+    alpha: float = 0.15,
+    iters: int = 30,
+) -> np.ndarray:
+    """
+    Simple undirected PPR via power iteration.
+    """
+    nbrs = [[] for _ in range(num_nodes)]
+    for u, v in edges:
+        if u == v:
+            continue
+        if 0 <= u < num_nodes and 0 <= v < num_nodes:
+            nbrs[u].append(v)
+            nbrs[v].append(u)
+
+    deg = np.array([len(n) for n in nbrs], dtype=np.float32)
+    deg[deg == 0] = 1.0
+
+    r = np.zeros(num_nodes, dtype=np.float32)
+    p0 = np.zeros(num_nodes, dtype=np.float32)
+
+    if len(seeds) == 0:
+        return r
+
+    p0[seeds] = 1.0 / float(len(seeds))
+    r[:] = p0
+
+    for _ in range(iters):
+        new_r = alpha * p0
+        for u in range(num_nodes):
+            ru = r[u] / deg[u]
+            if ru == 0:
+                continue
+            for v in nbrs[u]:
+                new_r[v] += (1.0 - alpha) * ru
+        r = new_r
+
+    return r
+
+
+def _compute_ip_struct_features(df: pd.DataFrame, src_ip_col: str, dst_ip_col: str) -> pd.DataFrame:
+    """
+    Compute per-IP structural features using edges from df.
+      deg_in/out, uniq_in/out, kcore (optional)
+    """
+    src = df[src_ip_col].astype(str).to_numpy()
+    dst = df[dst_ip_col].astype(str).to_numpy()
+
+    all_ips = np.unique(np.concatenate([src, dst], axis=0))
+    ip2i = {ip: i for i, ip in enumerate(all_ips)}
+    n = len(all_ips)
+
+    deg_out = np.zeros(n, dtype=np.float32)
+    deg_in = np.zeros(n, dtype=np.float32)
+    for s, d in zip(src, dst):
+        deg_out[ip2i[s]] += 1
+        deg_in[ip2i[d]] += 1
+
+    seen_out = [set() for _ in range(n)]
+    seen_in = [set() for _ in range(n)]
+    for s, d in zip(src, dst):
+        si = ip2i[s]
+        di = ip2i[d]
+        seen_out[si].add(di)
+        seen_in[di].add(si)
+
+    uniq_out = np.array([float(len(seen_out[i])) for i in range(n)], dtype=np.float32)
+    uniq_in = np.array([float(len(seen_in[i])) for i in range(n)], dtype=np.float32)
+
+    # k-core (undirected)
+    kcore = np.zeros(n, dtype=np.float32)
+    try:
+        import networkx as nx
+
+        G = nx.Graph()
+        G.add_nodes_from(range(n))
+        for s, d in zip(src, dst):
+            G.add_edge(ip2i[s], ip2i[d])
+        core = nx.core_number(G)
+        for k, v in core.items():
+            if 0 <= int(k) < n:
+                kcore[int(k)] = float(v)
+    except Exception:
+        pass
+
+    # log1p normalization
+    deg_in = np.log1p(deg_in)
+    deg_out = np.log1p(deg_out)
+    uniq_in = np.log1p(uniq_in)
+    uniq_out = np.log1p(uniq_out)
+    kcore = np.log1p(kcore)
+
+    feat = pd.DataFrame(
+        {
+            "ip": all_ips,
+            "deg_in": deg_in,
+            "deg_out": deg_out,
+            "uniq_in": uniq_in,
+            "uniq_out": uniq_out,
+            "kcore": kcore,
+        }
+    )
+    return feat
+
+
+def _learn_pairwise_weights(
+    df_feat: pd.DataFrame,
+    target_col: str = "kcore",
+    lr: float = 0.05,
+    steps: int = 400,
+    margin: float = 0.2,
+    seed: int = 0,
+) -> Tuple[Dict[str, float], float]:
+    """
+    Learn linear weights to rank larger target_col higher (pairwise hinge).
+
+    Use as a *refinement* head over base_score (PPR×anom).
+    """
+    rng = np.random.default_rng(seed)
+    feat_cols = [c for c in df_feat.columns if c not in ["ip", target_col]]
+
+    X = df_feat[feat_cols].values.astype(np.float32)
+    y = df_feat[target_col].values.astype(np.float32)
+
+    if len(X) == 0 or np.std(y) < 1e-6:
+        w = np.zeros((X.shape[1],), dtype=np.float32)
+        b = 0.0
+        return {feat_cols[i]: float(w[i]) for i in range(len(feat_cols))}, float(b)
+
+    # standardize
+    X_mean = X.mean(axis=0, keepdims=True)
+    X_std = X.std(axis=0, keepdims=True) + 1e-6
+    Xn = (X - X_mean) / X_std
+
+    w = np.zeros((Xn.shape[1],), dtype=np.float32)
+    idx = np.arange(len(y))
+
+    for _ in range(steps):
+        i = rng.choice(idx, size=min(512, len(idx)), replace=True)
+        j = rng.choice(idx, size=min(512, len(idx)), replace=True)
+
+        mask = y[i] > y[j]
+        if mask.sum() == 0:
             continue
 
-        src_ip = str(row.get(src_ip_col, "")) if track_unique_src else None
+        ii = i[mask]
+        jj = j[mask]
 
-        if key not in acc_map:
-            acc_map[key] = create_accumulator(method, topk, tau, track_unique_src, max_unique_src)
-        acc_map[key].update(score, src_ip=src_ip)
+        si = Xn[ii] @ w
+        sj = Xn[jj] @ w
 
-        if emit_global:
-            if key not in global_map:
-                global_map[key] = create_accumulator(method, topk, tau, track_unique_src, max_unique_src)
-            global_map[key].update(score, src_ip=src_ip)
+        diff = si - sj
+        vio = (margin - diff) > 0
+        if vio.sum() == 0:
+            continue
 
-    # final flush
-    if current_ws is not None and current_we is not None:
-        flush_window(current_ws, current_we)
+        grad = -(Xn[ii[vio]] - Xn[jj[vio]]).mean(axis=0)
+        w -= lr * grad
 
-    if emit_global and global_map:
-        top_rows = top_n_from_map(global_map, topn)
-        out_path = os.path.join(out_dir, "rank_GLOBAL.csv")
-        key_name = "dst_ip" if key_mode == "dst_ip" else "endpoint"
-        dump_window_csv(out_path, datetime(1970,1,1,tzinfo=timezone.utc), datetime(1970,1,1,tzinfo=timezone.utc), key_name, top_rows)
+    # unnormalize back to original space
+    w_real = w / X_std[0]
+    b_real = -float((X_mean[0] / X_std[0]) @ w)
+
+    weights = {feat_cols[i]: float(w_real[i]) for i in range(len(feat_cols))}
+    return weights, float(b_real)
 
 
-def aggregate_non_stream(
-    input_path: str,
-    input_format: str,
-    ts_col: str,
+def _rank_ppr_anom_pairwise(
+    df: pd.DataFrame,
     src_ip_col: str,
     dst_ip_col: str,
     score_col: str,
-    dst_port_col: str,
-    proto_col: str,
-    key_mode: str,
-    window_sec: int,
-    method: str,
-    topk: int,
-    tau: float,
-    topn: int,
-    out_dir: str,
-    track_unique_src: bool,
-    max_unique_src: int,
-    emit_global: bool,
-) -> None:
-    # Load all then groupby. Safer if input is not sorted, but needs RAM.
-    if input_format == "csv":
-        df = pd.read_csv(input_path)
-    else:
-        df = pd.read_parquet(input_path)
+    key_mode: str = "dst_ip",
+    topn: int = 20,
+    # PPR params
+    ppr_alpha: float = 0.15,
+    ppr_iters: int = 30,
+    ppr_beta: float = 3.0,
+    seed_topk: int = 2000,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Global ranking:
+      base_score = anomaly_sum(key) * (1 + beta * PPR(key))
+      final_score = base_score * (1 + sigmoid(linear(struct)))
+    """
+    # --- node index
+    all_ips = pd.concat([df[src_ip_col], df[dst_ip_col]]).astype(str).tolist()
+    ip2i, i2ip = _build_node_index_from_ips(all_ips)
+    num_nodes = len(i2ip)
 
-    df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
-    window = f"{window_sec}S"
-    df["__ws"] = df[ts_col].dt.floor(window)
+    # --- edges (undirected)
+    edges: List[Tuple[int, int]] = []
+    for s, d in zip(df[src_ip_col].astype(str).tolist(), df[dst_ip_col].astype(str).tolist()):
+        edges.append((ip2i[s], ip2i[d]))
 
+    # --- seeds: endpoints of top anomalous flows
+    df_seed = df.nlargest(min(seed_topk, len(df)), columns=score_col)
+    seed_ips = set(df_seed[src_ip_col].astype(str).tolist() + df_seed[dst_ip_col].astype(str).tolist())
+    seeds = [ip2i[ip] for ip in seed_ips if ip in ip2i]
+
+    ppr = _ppr_power_iteration(edges, num_nodes, seeds, alpha=ppr_alpha, iters=ppr_iters)
+    if ppr.max() > 0:
+        ppr = ppr / (ppr.max() + 1e-12)
+
+    # --- anomaly aggregation per key
     if key_mode == "dst_ip":
-        df["__key"] = df[dst_ip_col].astype(str)
-        key_name = "dst_ip"
+        keys = df[dst_ip_col].astype(str)
+        gdf = df.copy()
+        gdf["__key"] = keys
+    elif key_mode == "src_ip":
+        keys = df[src_ip_col].astype(str)
+        gdf = df.copy()
+        gdf["__key"] = keys
     else:
-        # endpoint mode
-        df["__key"] = (
-            df[dst_ip_col].astype(str)
-            + ":"
-            + df.get(dst_port_col, "").astype(str)
-            + ":"
-            + df.get(proto_col, "").astype(str)
-        )
-        key_name = "endpoint"
+        # both
+        dfa = df.copy()
+        dfb = df.copy()
+        dfa["__key"] = dfa[src_ip_col].astype(str)
+        dfb["__key"] = dfb[dst_ip_col].astype(str)
+        gdf = pd.concat([dfa, dfb], axis=0, ignore_index=True)
 
-    os.makedirs(out_dir, exist_ok=True)
+    anom_sum = gdf.groupby("__key", sort=False)[score_col].sum().reset_index()
+    anom_sum.columns = ["ip", "anomaly_sum"]
 
-    def score_group(g: pd.DataFrame) -> float:
-        s = g[score_col].astype(float).to_numpy()
-        if method == "topk_sum":
-            k = max(1, topk)
-            if len(s) <= k:
-                return float(s.sum())
-            # partial sort
-            import numpy as np
-            idx = np.argpartition(s, -k)[-k:]
-            return float(s[idx].sum())
-        if method == "exceed_sum":
-            return float(((s - tau) * (s > tau)).sum())
-        if method == "mean":
-            return float(s.mean()) if len(s) else 0.0
-        if method == "max":
-            return float(s.max()) if len(s) else 0.0
-        raise ValueError(method)
+    # --- struct features from entire df
+    feat_struct = _compute_ip_struct_features(df, src_ip_col, dst_ip_col)
 
-    # per-window ranking
-    for ws, gws in df.groupby("__ws"):
-        scores = gws.groupby("__key", sort=False).apply(score_group, include_groups=False)
-        counts = gws.groupby("__key", sort=False).size()
-        if track_unique_src:
-            nunique = gws.groupby("__key", sort=False)[src_ip_col].nunique()
-        else:
-            nunique = None
+    # --- join
+    anom_sum["ppr"] = anom_sum["ip"].map(lambda x: float(ppr[ip2i.get(str(x), 0)]) if str(x) in ip2i else 0.0)
+    feat = anom_sum.merge(feat_struct, on="ip", how="left").fillna(0)
 
-        top = scores.sort_values(ascending=False).head(topn)
-        out_path = os.path.join(out_dir, f"rank_{ws.strftime('%Y%m%dT%H%M%SZ')}_{(ws + pd.Timedelta(seconds=window_sec)).strftime('%Y%m%dT%H%M%SZ')}.csv")
-        with open(out_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["window_start_utc", "window_end_utc", key_name, "score", "flow_count", "src_ip_nunique"])
-            for key, sc in top.items():
-                w.writerow([
-                    ws.to_pydatetime().isoformat(),
-                    (ws + pd.Timedelta(seconds=window_sec)).to_pydatetime().isoformat(),
-                    key,
-                    f"{float(sc):.10g}",
-                    int(counts.loc[key]),
-                    "" if nunique is None else int(nunique.loc[key]),
-                ])
+    # --- base
+    feat["base_score"] = feat["anomaly_sum"] * (1.0 + ppr_beta * feat["ppr"])
 
-    if emit_global:
-        scores = df.groupby("__key", sort=False).apply(score_group, include_groups=False).sort_values(ascending=False).head(topn)
-        counts = df.groupby("__key", sort=False).size()
-        if track_unique_src:
-            nunique = df.groupby("__key", sort=False)[src_ip_col].nunique()
-        else:
-            nunique = None
-        out_path = os.path.join(out_dir, "rank_GLOBAL.csv")
-        with open(out_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["window_start_utc", "window_end_utc", key_name, "score", "flow_count", "src_ip_nunique"])
-            for key, sc in scores.items():
-                w.writerow([
-                    datetime(1970,1,1,tzinfo=timezone.utc).isoformat(),
-                    datetime(1970,1,1,tzinfo=timezone.utc).isoformat(),
-                    key,
-                    f"{float(sc):.10g}",
-                    int(counts.loc[key]),
-                    "" if nunique is None else int(nunique.loc[key]),
-                ])
+    # --- pairwise refinement (depth proxy: kcore)
+    learn_cols = ["ip", "anomaly_sum", "ppr", "deg_in", "deg_out", "uniq_in", "uniq_out", "kcore"]
+    weights, bias = _learn_pairwise_weights(feat[learn_cols].copy(), target_col="kcore")
+
+    def lin_score(row: pd.Series) -> float:
+        s = bias
+        for k, w in weights.items():
+            s += w * float(row.get(k, 0.0))
+        return float(s)
+
+    feat["learned_score"] = feat.apply(lin_score, axis=1)
+    feat["final_score"] = feat["base_score"] * (1.0 + 1.0 / (1.0 + np.exp(-feat["learned_score"])))
+
+    feat = feat.sort_values("final_score", ascending=False).head(topn).reset_index(drop=True)
+
+    meta = {
+        "weights": weights,
+        "bias": bias,
+        "ppr_alpha": ppr_alpha,
+        "ppr_iters": ppr_iters,
+        "ppr_beta": ppr_beta,
+        "seed_topk": seed_topk,
+    }
+    return feat, meta
 
 
-# -----------------------------
-# CLI
-# -----------------------------
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Per-flow score file (CSV or Parquet)")
-    ap.add_argument("--format", choices=["csv", "parquet"], default="csv")
-    ap.add_argument("--out_dir", required=True)
-
-    ap.add_argument("--ts_col", default="ts")
-    ap.add_argument("--src_ip_col", default="src_ip")
-    ap.add_argument("--dst_ip_col", default="dst_ip")
-    ap.add_argument("--score_col", default="anomaly_score")
-    ap.add_argument("--dst_port_col", default="dst_port")
-    ap.add_argument("--proto_col", default="proto")
-
-    ap.add_argument("--key_mode", choices=["dst_ip", "endpoint"], default="dst_ip",
-                    help="dst_ip: rank by dst_ip, endpoint: rank by dst_ip:dst_port:proto")
-
-    ap.add_argument("--window_sec", type=int, default=3600, help="Time window seconds (default 3600=1h)")
-    ap.add_argument("--method", choices=["topk_sum", "exceed_sum", "mean", "max"], default="topk_sum")
-    ap.add_argument("--topk", type=int, default=20, help="k for topk_sum")
-    ap.add_argument("--tau", type=float, default=0.0, help="tau for exceed_sum")
-    ap.add_argument("--topn", type=int, default=50, help="top N keys output per window")
-
-    ap.add_argument("--chunksize", type=int, default=500000, help="CSV chunksize for streaming")
-    ap.add_argument("--no_stream", action="store_true", help="Disable streaming (loads all, works if ts unsorted)")
-    ap.add_argument("--track_unique_src", action="store_true",
-                    help="Also compute src_ip distinct count per key (memory heavier)")
-    ap.add_argument("--max_unique_src", type=int, default=50000,
-                    help="Cap unique src_ip stored per key in streaming mode")
-    ap.add_argument("--emit_global", action="store_true", help="Also output rank_GLOBAL.csv")
-
-    args = ap.parse_args()
-
-    if args.method == "exceed_sum" and args.tau <= 0.0:
-        raise SystemExit("--method exceed_sum requires --tau > 0")
-
-    if args.no_stream:
-        aggregate_non_stream(
-            input_path=args.input,
-            input_format=args.format,
-            ts_col=args.ts_col,
-            src_ip_col=args.src_ip_col,
-            dst_ip_col=args.dst_ip_col,
-            score_col=args.score_col,
-            dst_port_col=args.dst_port_col,
-            proto_col=args.proto_col,
-            key_mode=args.key_mode,
-            window_sec=args.window_sec,
-            method=args.method,
-            topk=args.topk,
-            tau=args.tau,
-            topn=args.topn,
-            out_dir=args.out_dir,
-            track_unique_src=args.track_unique_src,
-            max_unique_src=args.max_unique_src,
-            emit_global=args.emit_global,
-        )
-    else:
-        aggregate_streaming(
-            input_path=args.input,
-            input_format=args.format,
-            ts_col=args.ts_col,
-            src_ip_col=args.src_ip_col,
-            dst_ip_col=args.dst_ip_col,
-            score_col=args.score_col,
-            dst_port_col=args.dst_port_col,
-            proto_col=args.proto_col,
-            key_mode=args.key_mode,
-            window_sec=args.window_sec,
-            method=args.method,
-            topk=args.topk,
-            tau=args.tau,
-            topn=args.topn,
-            chunksize=args.chunksize,
-            out_dir=args.out_dir,
-            track_unique_src=args.track_unique_src,
-            max_unique_src=args.max_unique_src,
-            emit_global=args.emit_global,
-        )
-
+# ============================================================
+# Public API: aggregate_from_df
+# ============================================================
 def aggregate_from_df(
-    df: "pd.DataFrame",
+    df: pd.DataFrame,
     ts_col: str = "ts",
     src_ip_col: str = "src_ip",
     dst_ip_col: str = "dst_ip",
     score_col: str = "anomaly_score",
-    dst_port_col: str = "dst_port",
-    proto_col: str = "proto",
+    dst_port_col: Optional[str] = None,
+    proto_col: Optional[str] = None,
     key_mode: str = "dst_ip",
     window_sec: int = 3600,
     method: str = "topk_sum",
-    topk: int = 20,
+    topk: int = 10,
     tau: float = 0.0,
-    topn: int = 50,
+    topn: int = 20,
     out_dir: str = "rankings",
-    track_unique_src: bool = False,
-    max_unique_src: int = 50000,
+    track_unique_src: bool = True,
+    max_unique_src: int = 10000,
     emit_global: bool = True,
-) -> None:
-    os.makedirs(out_dir, exist_ok=True)
+) -> pd.DataFrame:
+    """
+    Aggregate anomaly scores into "suspicious IP ranking".
 
-    # ts が無い場合：GLOBAL のみ出す（時間窓は作らない）
-    if ts_col not in df.columns:
-        if not emit_global:
-            return
+    Parameters
+    ----------
+    df : DataFrame with columns [src_ip_col, dst_ip_col, score_col, ts_col(optional)]
+    key_mode : "dst_ip" | "src_ip" | "both"
+    method :
+      - "topk_sum" : sum of top-k anomaly scores per key (baseline)
+      - "ppr_anom_pairwise" : (PPR diffusion × anomaly) + pairwise refinement using k-core as depth proxy
+    window_sec : per-window ranking, e.g., 3600 for 1 hour
+    emit_global : create rank_GLOBAL.csv
+    """
+    _safe_mkdir(out_dir)
 
-        # key 作成
-        if key_mode == "dst_ip":
-            df_key = df[dst_ip_col].astype(str)
-            key_name = "dst_ip"
-        elif key_mode == "endpoint":
-            df_key = (
-                df[dst_ip_col].astype(str)
-                + ":" + df.get(dst_port_col, "").astype(str)
-                + ":" + df.get(proto_col, "").astype(str)
-            )
-            key_name = "endpoint"
-        else:
-            raise ValueError(f"Unknown key_mode={key_mode}")
+    # basic columns sanity
+    need_cols = {src_ip_col, dst_ip_col, score_col}
+    missing = [c for c in need_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"aggregate_from_df: missing columns: {missing}")
 
-        s = df[score_col].astype(float).to_numpy()
+    df = df.copy()
+    df[src_ip_col] = df[src_ip_col].astype(str)
+    df[dst_ip_col] = df[dst_ip_col].astype(str)
 
-        def score_group(g: "pd.DataFrame") -> float:
-            arr = g[score_col].astype(float).to_numpy()
-            if method == "topk_sum":
-                k = max(1, topk)
-                if len(arr) <= k:
-                    return float(arr.sum())
-                idx = np.argpartition(arr, -k)[-k:]
-                return float(arr[idx].sum())
-            if method == "exceed_sum":
-                return float(((arr - tau) * (arr > tau)).sum())
-            if method == "mean":
-                return float(arr.mean()) if len(arr) else 0.0
-            if method == "max":
-                return float(arr.max()) if len(arr) else 0.0
-            raise ValueError(method)
+    # filter tau
+    df = _maybe_filter_tau(df, score_col, tau)
 
-        tmp = df.copy()
-        tmp["__key"] = df_key
-        scores = tmp.groupby("__key", sort=False).apply(score_group).sort_values(ascending=False).head(topn)
-        counts = tmp.groupby("__key", sort=False).size()
-        nunique = tmp.groupby("__key", sort=False)[src_ip_col].nunique() if track_unique_src else None
+    # ensure ts
+    if ts_col in df.columns:
+        df[ts_col] = _ensure_datetime_series(df[ts_col])
+    else:
+        # allow global ranking only
+        df[ts_col] = pd.NaT
+
+    # create key
+    if key_mode == "dst_ip":
+        df["__key"] = df[dst_ip_col].astype(str)
+    elif key_mode == "src_ip":
+        df["__key"] = df[src_ip_col].astype(str)
+    elif key_mode == "both":
+        # duplicate
+        dfa = df.copy()
+        dfb = df.copy()
+        dfa["__key"] = dfa[src_ip_col].astype(str)
+        dfb["__key"] = dfb[dst_ip_col].astype(str)
+        df = pd.concat([dfa, dfb], axis=0, ignore_index=True)
+    else:
+        raise ValueError("key_mode must be one of: dst_ip, src_ip, both")
+
+    # ---------------------------
+    # Method: PPR×Anom + Pairwise
+    # ---------------------------
+    if method in ["ppr_anom_pairwise", "ppr_anom"]:
+        # global only (can be extended to window ranking later)
+        df_rank, meta = _rank_ppr_anom_pairwise(
+            df=df.dropna(subset=["__key"]),
+            src_ip_col=src_ip_col,
+            dst_ip_col=dst_ip_col,
+            score_col=score_col,
+            key_mode=key_mode,
+            topn=topn,
+        )
 
         out_path = os.path.join(out_dir, "rank_GLOBAL.csv")
-        with open(out_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["window_start_utc", "window_end_utc", key_name, "score", "flow_count", "src_ip_nunique"])
-            for key, sc in scores.items():
-                w.writerow([
-                    datetime(1970,1,1,tzinfo=timezone.utc).isoformat(),
-                    datetime(1970,1,1,tzinfo=timezone.utc).isoformat(),
-                    key,
-                    f"{float(sc):.10g}",
-                    int(counts.loc[key]),
-                    "" if nunique is None else int(nunique.loc[key]),
-                ])
-        return
+        df_rank.to_csv(out_path, index=False)
 
-    # ts がある場合：既存の non-stream 相当で時間窓＋GLOBAL
-    tmp_path = os.path.join(out_dir, "_tmp_flows_for_ranking.csv")
-    df.to_csv(tmp_path, index=False)
+        # save meta
+        try:
+            with open(os.path.join(out_dir, "rank_model_meta.json"), "w") as f:
+                json.dump(meta, f, indent=2)
+        except Exception:
+            pass
 
-    aggregate_non_stream(
-        input_path=tmp_path,
-        input_format="csv",
-        ts_col=ts_col,
-        src_ip_col=src_ip_col,
-        dst_ip_col=dst_ip_col,
-        score_col=score_col,
-        dst_port_col=dst_port_col,
-        proto_col=proto_col,
-        key_mode=key_mode,
-        window_sec=window_sec,
-        method=method,
-        topk=topk,
-        tau=tau,
-        topn=topn,
-        out_dir=out_dir,
-        track_unique_src=track_unique_src,
-        max_unique_src=max_unique_src,
-        emit_global=emit_global,
-    )
+        return df_rank
+
+    # ---------------------------
+    # Method: baseline topk_sum
+    # ---------------------------
+    # per-window ranking
+    if df[ts_col].notna().any():
+        # lowercase 's' to avoid pandas FutureWarning
+        window = f"{int(window_sec)}s"
+        df["__ws"] = df[ts_col].dt.floor(window)
+
+        # group by window+key
+        # Avoid groupby.apply deprecation by manual loop (small overhead, stable)
+        ws_values = df["__ws"].dropna().unique()
+        ws_values = sorted(ws_values)
+
+        for ws in ws_values:
+            df_ws = df[df["__ws"] == ws]
+            if df_ws.empty:
+                continue
+
+            rows = []
+            for k, g in df_ws.groupby("__key", sort=False):
+                out = _topk_sum_group(
+                    g,
+                    score_col=score_col,
+                    topk=topk,
+                    src_ip_col=src_ip_col,
+                    track_unique_src=track_unique_src,
+                    max_unique_src=max_unique_src,
+                )
+                rows.append(
+                    {
+                        "ip": str(k),
+                        "score": out["score"],
+                        "n_flows": out["n_flows"],
+                        "topk_used": out["topk_used"],
+                        "unique_src": out.get("unique_src", None),
+                        "window_start": ws,
+                    }
+                )
+
+            df_rank_ws = pd.DataFrame(rows)
+            df_rank_ws = df_rank_ws.sort_values("score", ascending=False).head(topn)
+
+            # file name
+            # safe format
+            ws_str = pd.Timestamp(ws).strftime("%Y%m%d_%H%M%S")
+            out_path = os.path.join(out_dir, f"rank_WS_{ws_str}.csv")
+            df_rank_ws.to_csv(out_path, index=False)
+
+    # global ranking
+    if emit_global:
+        rows = []
+        for k, g in df.groupby("__key", sort=False):
+            out = _topk_sum_group(
+                g,
+                score_col=score_col,
+                topk=topk,
+                src_ip_col=src_ip_col,
+                track_unique_src=track_unique_src,
+                max_unique_src=max_unique_src,
+            )
+            rows.append(
+                {
+                    "ip": str(k),
+                    "score": out["score"],
+                    "n_flows": out["n_flows"],
+                    "topk_used": out["topk_used"],
+                    "unique_src": out.get("unique_src", None),
+                }
+            )
+
+        df_rank = pd.DataFrame(rows).sort_values("score", ascending=False).head(topn).reset_index(drop=True)
+        out_path = os.path.join(out_dir, "rank_GLOBAL.csv")
+        df_rank.to_csv(out_path, index=False)
+        return df_rank
+
+    # fallback
+    return pd.DataFrame(columns=["ip", "score", "n_flows", "topk_used", "unique_src"])
 
 
-if __name__ == "__main__":
-    main()
+
+def rank_ppr_anomaly(
+    df: pd.DataFrame,
+    src_ip_col="src_ip",
+    dst_ip_col="dst_ip",
+    score_col="anomaly_score",
+    ts_col="ts",
+    window_sec: int | None = None,
+    threshold: float | None = None,
+    alpha: float = 0.15,
+    iters: int = 50,
+    reverse: bool = False,   # True にすると dst->src 方向に拡散（「深さ」を逆向きに見る用途）
+    beta_deg: float = 0.30,  # degreeボーナス
+    beta_src: float = 0.50,  # unique_srcボーナス
+    topn: int = 20,
+) -> pd.DataFrame:
+    """
+    PPR diffusion over graph × anomaly.
+    - base score: incoming anomaly sum (or filtered by threshold)
+    - propagate via PageRank
+    - optionally add degree/unique_src bonus
+    """
+
+    import numpy as np
+    import pandas as pd
+
+    if df.empty:
+        return pd.DataFrame(columns=["ip", "score", "base", "in_deg", "out_deg", "unique_src"])
+
+    work = df.copy()
+
+    # --- score filter ---
+    if threshold is not None:
+        work = work[work[score_col] >= float(threshold)]
+        if work.empty:
+            # fallback: keep top 1% if everything filtered out
+            work = df.nlargest(max(1, len(df)//100), score_col).copy()
+
+    # --- time windows (optional) ---
+    if window_sec is not None and ts_col in work.columns:
+        # try convert to datetime
+        ts = pd.to_datetime(work[ts_col], unit="ns", errors="coerce")
+        if ts.notna().any():
+            work["__ws"] = ts.dt.floor(f"{int(window_sec)}s")
+        else:
+            work["__ws"] = "GLOBAL"
+    else:
+        work["__ws"] = "GLOBAL"
+
+    all_scores = {}
+
+    for ws, g in work.groupby("__ws", sort=False):
+        # nodes
+        nodes = pd.Index(pd.unique(pd.concat([g[src_ip_col], g[dst_ip_col]], ignore_index=True)))
+        node2i = {n: i for i, n in enumerate(nodes)}
+        n = len(nodes)
+        if n == 0:
+            continue
+
+        # edges
+        src = g[src_ip_col].map(node2i).to_numpy(dtype=np.int64)
+        dst = g[dst_ip_col].map(node2i).to_numpy(dtype=np.int64)
+        w = g[score_col].to_numpy(dtype=np.float64)
+
+        if reverse:
+            src, dst = dst, src  # reverse direction
+
+        # adjacency matrix (dense: node数が小さい前提。44ノードなら余裕)
+        A = np.zeros((n, n), dtype=np.float64)
+        np.add.at(A, (src, dst), w)
+
+        row_sum = A.sum(axis=1, keepdims=True)
+        P = np.divide(A, row_sum, out=np.zeros_like(A), where=row_sum > 0)  # row-stochastic
+
+        # base score = incoming anomaly
+        base = np.zeros(n, dtype=np.float64)
+        np.add.at(base, dst, w)
+        s = base.sum()
+        if s <= 0:
+            continue
+        base = base / s
+
+        # PPR: r = alpha*base + (1-alpha)*P^T*r
+        r = base.copy()
+        for _ in range(int(iters)):
+            r = alpha * base + (1.0 - alpha) * (P.T @ r)
+
+        # degree features (from A>0, not raw edge count)
+        out_deg = (A > 0).sum(axis=1).astype(np.float64)
+        in_deg = (A > 0).sum(axis=0).astype(np.float64)
+
+        # unique src per dst (original方向で見るのが自然なので g で作る)
+        uniq_src = g.groupby(dst_ip_col)[src_ip_col].nunique()
+        uniq_src_vec = np.array([uniq_src.get(ip, 0) for ip in nodes], dtype=np.float64)
+
+        # final score
+        score = r.copy()
+        score = score * (1.0 + beta_deg * np.log1p(in_deg))
+        score = score * (1.0 + beta_src * np.log1p(uniq_src_vec))
+
+        # accumulate
+        for i, ip in enumerate(nodes):
+            all_scores[ip] = all_scores.get(ip, 0.0) + float(score[i])
+
+    out = pd.DataFrame(
+        [{"ip": k, "score": v} for k, v in all_scores.items()]
+    ).sort_values("score", ascending=False)
+
+    return out.head(topn).reset_index(drop=True)

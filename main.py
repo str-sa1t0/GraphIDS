@@ -1,3 +1,4 @@
+# main.py
 import os
 import random
 import warnings
@@ -15,6 +16,7 @@ from utils.parser import Parser
 from utils.trainers import test, train_encoder
 import rank_ips
 
+
 # Suppress this warning: even if in prototype stage, it works correctly for our use case
 warnings.filterwarnings(
     "ignore", message="The PyTorch API of nested tensors is in prototype stage"
@@ -30,20 +32,6 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def _to_list_mapping(node_mapping, idx_array: np.ndarray) -> list[str]:
-    """
-    node_mapping があれば node_id -> ip文字列へ変換。
-    無ければ node_id を文字列として返す（ランキングを止めないため）。
-    """
-    if node_mapping is None:
-        return [str(int(i)) for i in idx_array]
-    try:
-        return [str(node_mapping[int(i)]) for i in idx_array]
-    except Exception:
-        # 変換に失敗しても止めない（型や範囲ズレ対策）
-        return [str(int(i)) for i in idx_array]
 
 
 def _maybe_get_edge_attr_numpy(g, attr_name: str, expected_len: int) -> np.ndarray | None:
@@ -89,6 +77,7 @@ def main(run):
     ndim_in = dataset.num_node_features
     edim_in = dataset.num_edge_features
     print("Number of features:", edim_in)
+    print("Node feature dim:", ndim_in)
 
     model = GraphIDS(
         ndim_in=ndim_in,
@@ -105,35 +94,23 @@ def main(run):
         mask_ratio=config.mask_ratio,
     ).to(device)
 
+    # -----------------------------
+    # Optimizer: include extra heads if they exist
+    # -----------------------------
     param_groups = [
-        {  # Higher weight decay for embedding layer
-            "params": model.encoder.parameters(),
-            "weight_decay": config.weight_decay,
-        },
-        {  # Lower weight decay for the transformer
-            "params": model.transformer.parameters(),
-            "weight_decay": config.ae_weight_decay,
-        },
+        {"params": model.encoder.parameters(), "weight_decay": config.weight_decay},
+        {"params": model.transformer.parameters(), "weight_decay": config.ae_weight_decay},
     ]
-
     if hasattr(model, "temporal_head"):
-        param_groups.append(
-            {
-                "params": model.temporal_head.parameters(),
-                "weight_decay": config.ae_weight_decay,
-            }
-        )
-
+        param_groups.append({"params": model.temporal_head.parameters(), "weight_decay": config.ae_weight_decay})
     if hasattr(model, "proj_head"):
-        param_groups.append(
-            {
-                "params": model.proj_head.parameters(),
-                "weight_decay": config.ae_weight_decay,
-            }
-        )
+        param_groups.append({"params": model.proj_head.parameters(), "weight_decay": config.ae_weight_decay})
 
     optimizer = torch.optim.AdamW(param_groups, lr=config.learning_rate)
 
+    # -----------------------------
+    # Checkpoint
+    # -----------------------------
     checkpoint = config.checkpoint
     if checkpoint is not None and os.path.exists(checkpoint):
         print("Loading model from checkpoint")
@@ -156,8 +133,12 @@ def main(run):
     recommended_workers = min(cpu_count, 6) if cpu_count is not None else 0
     persistent = True if recommended_workers and recommended_workers > 0 else False
 
+    # -----------------------------
+    # DataLoaders
+    # -----------------------------
     if start_epoch >= config.num_epochs or config.test:
-        print("Model already trained")
+        print("Model already trained OR test-only mode")
+
         test_loader = LinkNeighborLoader(
             data=dataset.test_graph,
             num_neighbors=fanout_list,
@@ -189,7 +170,7 @@ def main(run):
             edge_label_index=dataset.val_graph.edge_index,
             edge_label=dataset.val_graph.edge_labels,
             batch_size=config.batch_size,
-            shuffle=shuffle,
+            shuffle=False,
             num_workers=recommended_workers,
             pin_memory=True,
             persistent_workers=persistent,
@@ -210,21 +191,25 @@ def main(run):
 
         print("Starting training...")
         model, threshold = train_encoder(
-            model,
-            config.window_size,
-            config.step_percent,
-            config.ae_batch_size,
-            train_loader,
-            val_loader,
-            test_loader,
-            start_epoch,
-            config.num_epochs,
-            optimizer,
-            run,
-            config.patience,
-            checkpoint,
+            model=model,
+            window_size=config.window_size,
+            step_percent=config.step_percent,
+            ae_batch_size=config.ae_batch_size,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            start_epoch=start_epoch,
+            num_epochs=config.num_epochs,
+            optimizer=optimizer,
+            run=run,
+            patience=config.patience,
+            checkpoint=checkpoint,
+            device=device,
         )
 
+    # -----------------------------
+    # Evaluate
+    # -----------------------------
     print("Evaluating on test set...")
     test_f1, test_pr_auc, errors, test_labels, prediction_time = test(
         model,
@@ -235,9 +220,12 @@ def main(run):
         threshold=threshold,
     )
 
-    precision, recall, _ = precision_recall_curve(test_labels.cpu(), errors.cpu())
+    if errors.numel() and test_labels.numel() and errors.numel() == test_labels.numel():
+        precision, recall, _ = precision_recall_curve(test_labels.cpu(), errors.cpu())
+    else:
+        precision, recall = np.array([]), np.array([])
 
-    if config.save_curve:
+    if config.save_curve and errors.numel() and test_labels.numel():
         run.log(
             {
                 "Precision-Recall Curve": wandb.plot.pr_curve(
@@ -254,7 +242,8 @@ def main(run):
             recall=recall,
         )
 
-    test_pred = (errors > threshold).int()
+    test_pred = (errors > float(threshold)).int() if threshold is not None and errors.numel() else torch.zeros_like(test_labels)
+
     print(f"Test macro F1-score: {test_f1:.4f}")
     print(f"Test PR-AUC: {test_pr_auc:.4f}")
     print(f"Test prediction time: {prediction_time:.4f} seconds")
@@ -281,61 +270,41 @@ def main(run):
         }
     )
 
-    # --- Post-processing: Suspicious IP Ranking ---
+    # ============================================================
+    # Post-processing: Suspicious IP Ranking
+    # ============================================================
     print("Generating suspicious IP ranking...")
 
     run_id = run.name if getattr(run, "name", None) is not None else (
         run.id if getattr(run, "id", None) is not None else f"seed{config.seed}"
     )
 
-    # 1) node_id -> ip 変換用 mapping を可能な範囲で復元
+    # node_id -> ip mapping
     node_mapping = getattr(dataset, "mapping", None)
 
-    if node_mapping is None:
-        for cand in ["idx2ip", "idx2node", "id2ip", "id2node", "node_mapping"]:
-            if hasattr(dataset, cand):
-                node_mapping = getattr(dataset, cand)
-                break
-
-    if node_mapping is None and hasattr(dataset, "node_encoder"):
-        enc = getattr(dataset, "node_encoder")
-        if hasattr(enc, "classes_"):
-            node_mapping = list(enc.classes_)
-
     def idx_to_name(i: int) -> str:
-        """
-        node_mapping が list/dict のどちらでも動くようにする
-        """
         if node_mapping is None:
             return str(i)
-
         if isinstance(node_mapping, list):
             if 0 <= i < len(node_mapping):
                 return str(node_mapping[i])
             return str(i)
-
         if isinstance(node_mapping, dict):
             if i in node_mapping:
                 return str(node_mapping[i])
-            # keyが文字列のケースも吸収
             if str(i) in node_mapping:
                 return str(node_mapping[str(i)])
             return str(i)
-
         return str(i)
 
     try:
-        # 2) エッジ情報を取得
-        if hasattr(dataset.test_graph, "edge_label_index") and dataset.test_graph.edge_label_index is not None:
-            edge_index_t = dataset.test_graph.edge_label_index
-        else:
-            edge_index_t = dataset.test_graph.edge_index
-
+        g = dataset.test_graph
+        edge_index_t = g.edge_index
         edge_index = edge_index_t.detach().cpu().numpy()
+
         n_edges = edge_index.shape[1]
         n_scores = int(errors.shape[0])
 
-        # 3) サイズ不一致を安全に吸収
         if n_edges != n_scores:
             print(f"[WARN] mismatch: edges={n_edges}, scores={n_scores} -> truncate")
         n_use = min(n_edges, n_scores)
@@ -346,15 +315,15 @@ def main(run):
         src_ips = [idx_to_name(int(i)) for i in src_ids]
         dst_ips = [idx_to_name(int(i)) for i in dst_ids]
 
-        df_flows = pd.DataFrame({
-            "src_ip": src_ips,
-            "dst_ip": dst_ips,
-            "anomaly_score": errors[:n_use].detach().cpu().numpy(),
-        })
+        df_flows = pd.DataFrame(
+            {
+                "src_ip": src_ips,
+                "dst_ip": dst_ips,
+                "anomaly_score": errors[:n_use].detach().cpu().numpy(),
+            }
+        )
 
-        # 4) あれば ts/port/proto を付ける
-        g = dataset.test_graph
-
+        # optional meta
         ts = _maybe_get_edge_attr_numpy(g, "TIMESTAMP", n_use)
         if ts is not None:
             df_flows["ts"] = ts[:n_use]
@@ -367,36 +336,58 @@ def main(run):
         if proto is not None:
             df_flows["proto"] = proto[:n_use]
 
-        # 5) per-flow CSV 出力
         out_dir = "inference_outputs"
         os.makedirs(out_dir, exist_ok=True)
+
         flow_csv_path = os.path.join(out_dir, f"inference_flows_{run_id}.csv")
         df_flows.to_csv(flow_csv_path, index=False)
         print(f"Per-flow scores saved to: {flow_csv_path}")
 
-        # 6) Ranking 実行
         rank_out_dir = os.path.join(out_dir, f"rankings_{run_id}")
         print(f"Running IP ranking logic... Output: {rank_out_dir}")
 
-        rank_ips.aggregate_from_df(
-            df=df_flows,
-            ts_col="ts",
-            src_ip_col="src_ip",
-            dst_ip_col="dst_ip",
-            score_col="anomaly_score",
-            dst_port_col="dst_port",
-            proto_col="proto",
-            key_mode="dst_ip",
-            window_sec=3600,
-            method="topk_sum",
-            topk=10,
-            tau=0.0,
-            topn=20,
-            out_dir=rank_out_dir,
-            track_unique_src=True,
-            max_unique_src=10000,
-            emit_global=True
-        )
+        # You can switch ranking method here:
+        #   - "topk_sum"
+        #   - "ppr_anom_pairwise"
+        rank_method = getattr(config, "rank_method", "topk_sum")
+
+        if rank_method == "ppr_anom":
+            df_rank = rank_ips.rank_ppr_anomaly(
+                df_flows,
+                threshold=float(threshold) if threshold is not None else None,
+                window_sec=3600,      # まずは1時間窓
+                alpha=0.15,
+                iters=50,
+                reverse=False,        # 深さを逆向きに見たければ True も試す
+                topn=20,
+            )
+            os.makedirs(rank_out_dir, exist_ok=True)
+            out_path = os.path.join(rank_out_dir, "rank_GLOBAL.csv")
+            df_rank.to_csv(out_path, index=False)
+            print(f"[OK] PPR rank saved: {out_path}")
+
+            if len(df_rank) > 0:
+                run.log({"suspicious_ip_ranking": wandb.Table(dataframe=df_rank)})
+        else:
+            rank_ips.aggregate_from_df(
+                df=df_flows,
+                ts_col="ts",
+                src_ip_col="src_ip",
+                dst_ip_col="dst_ip",
+                score_col="anomaly_score",
+                dst_port_col="dst_port",
+                proto_col="proto",
+                key_mode="dst_ip",
+                window_sec=3600,
+                method=rank_method,
+                topk=10,
+                tau=0.0,
+                topn=20,
+                out_dir=rank_out_dir,
+                track_unique_src=True,
+                max_unique_src=10000,
+                emit_global=True,
+            )
 
         global_rank_path = os.path.join(rank_out_dir, "rank_GLOBAL.csv")
         if os.path.exists(global_rank_path):
@@ -413,6 +404,7 @@ def main(run):
 
 if __name__ == "__main__":
     args = Parser().parse_args()
+
     if args.config is not None:
         config = args.config
     else:

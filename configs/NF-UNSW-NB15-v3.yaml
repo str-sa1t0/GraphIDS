@@ -40,3 +40,5 @@ positional_encoding:
   value: None
 fraction:
   value: null
+rank_method: 
+  value: ppr_anom
