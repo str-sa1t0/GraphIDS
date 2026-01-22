@@ -41,4 +41,4 @@ positional_encoding:
 fraction:
   value: null
 rank_method: 
-  value: ppr_anom
+  value: "infra"

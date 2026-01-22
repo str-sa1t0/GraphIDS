@@ -15,6 +15,7 @@ from utils.dataloaders import NetFlowDataset
 from utils.parser import Parser
 from utils.trainers import test, train_encoder
 import rank_ips
+from rank_ips import rank_infra, InfraRankConfig
 
 
 # Suppress this warning: even if in prototype stage, it works correctly for our use case
@@ -274,6 +275,15 @@ def main(run):
     # Post-processing: Suspicious IP Ranking
     # ============================================================
     print("Generating suspicious IP ranking...")
+    rank_method = getattr(config, "rank_method", "topk_sum")
+
+    # ここで「何のmethodを使うか」を必ず出す
+    print(
+        "[RANK] "
+        f"rank_method={rank_method} "
+        f"tau(threshold)={float(threshold) if threshold is not None else None} "
+        f"window_sec=3600 key_mode=dst_ip topk=10 topn=20"
+    )
 
     run_id = run.name if getattr(run, "name", None) is not None else (
         run.id if getattr(run, "id", None) is not None else f"seed{config.seed}"
@@ -365,6 +375,30 @@ def main(run):
             out_path = os.path.join(rank_out_dir, "rank_GLOBAL.csv")
             df_rank.to_csv(out_path, index=False)
             print(f"[OK] PPR rank saved: {out_path}")
+
+            if len(df_rank) > 0:
+                run.log({"suspicious_ip_ranking": wandb.Table(dataframe=df_rank)})
+        elif rank_method == "infra":
+            df_rank = rank_infra(
+                df_flows,
+                InfraRankConfig(
+                    topn=20,
+                    hits_iters=50,
+                    use_threshold=float(threshold) if threshold is not None else None,  # GraphIDSの閾値を利用
+                    min_score=0.0,
+                    key_mode="dst_ip",           # "signature" も試せる
+                    beacon_min_events=6,
+                    max_edges_per_key=5000,
+                    include_private_dst=True,    # ここは環境に応じて
+                    include_private_src=True,
+                    hub_penalty=0.6,
+                )
+            )
+
+            os.makedirs(rank_out_dir, exist_ok=True)
+            out_path = os.path.join(rank_out_dir, "rank_GLOBAL.csv")
+            df_rank.to_csv(out_path, index=False)
+            print(f"[OK] Infra rank saved: {out_path}")
 
             if len(df_rank) > 0:
                 run.log({"suspicious_ip_ranking": wandb.Table(dataframe=df_rank)})

@@ -8,6 +8,8 @@ from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
 import pandas as pd
+import ipaddress
+
 
 
 # ============================================================
@@ -668,3 +670,374 @@ def rank_ppr_anomaly(
     ).sort_values("score", ascending=False)
 
     return out.head(topn).reset_index(drop=True)
+
+
+
+def _is_private_ip(ip: str) -> bool:
+    """Return True if ip is private/reserved/etc. Safe fallback."""
+    try:
+        return ipaddress.ip_address(str(ip)).is_private
+    except Exception:
+        return False
+
+
+def _infer_datetime_unit(ts: pd.Series) -> str:
+    """
+    Infer datetime unit from magnitude.
+    Accepts seconds, milliseconds, microseconds, nanoseconds.
+    """
+    s = pd.to_numeric(ts, errors="coerce").dropna()
+    if s.empty:
+        return "s"
+
+    mx = float(s.max())
+
+    # Rough thresholds for UNIX epoch scale:
+    # s  ~ 1e9
+    # ms ~ 1e12
+    # us ~ 1e15
+    # ns ~ 1e18
+    if mx > 1e17:
+        return "ns"
+    if mx > 1e14:
+        return "us"
+    if mx > 1e11:
+        return "ms"
+    return "s"
+
+
+def _to_datetime_safe(ts: pd.Series) -> pd.Series:
+    """
+    Convert timestamp series to pandas datetime, inferring unit.
+    Returns NaT for invalid.
+    """
+    unit = _infer_datetime_unit(ts)
+    out = pd.to_datetime(pd.to_numeric(ts, errors="coerce"), unit=unit, errors="coerce")
+    return out
+
+
+def _normalize_01(x: pd.Series, eps: float = 1e-12) -> pd.Series:
+    """Min-max normalize to [0,1]. If constant/empty -> zeros."""
+    if x is None or len(x) == 0:
+        return pd.Series([], dtype=float)
+    xmin = float(np.nanmin(x.to_numpy())) if x.notna().any() else 0.0
+    xmax = float(np.nanmax(x.to_numpy())) if x.notna().any() else 0.0
+    if abs(xmax - xmin) < eps:
+        return pd.Series(np.zeros(len(x), dtype=float), index=x.index)
+    return (x - xmin) / (xmax - xmin + eps)
+
+
+def _beacon_score_collective(ts_dt: np.ndarray, min_events: int = 6) -> float:
+    """
+    Beaconing score using *collective* inter-arrival stability for a target.
+    Input: ts_dt as datetime64[ns] array, already sorted or unsorted.
+    Output: score in [0,1], higher = more periodic/regular.
+    """
+    if ts_dt is None or len(ts_dt) < min_events:
+        return 0.0
+
+    # Sort, compute deltas in seconds
+    ts_dt = np.sort(ts_dt.astype("datetime64[ns]"))
+    delta_ns = np.diff(ts_dt).astype("timedelta64[ns]").astype(np.int64)
+    if len(delta_ns) < (min_events - 1):
+        return 0.0
+
+    delta_sec = delta_ns / 1e9
+    delta_sec = delta_sec[np.isfinite(delta_sec)]
+    delta_sec = delta_sec[delta_sec > 0]
+
+    if len(delta_sec) < (min_events - 1):
+        return 0.0
+
+    mean = float(np.mean(delta_sec))
+    std = float(np.std(delta_sec))
+    if mean <= 0:
+        return 0.0
+
+    # (1) Regularity via CV: lower CV => more periodic
+    cv = std / (mean + 1e-12)
+    regularity = 1.0 / (1.0 + cv)  # in (0,1]
+
+    # (2) Concentration: many deltas near the same value => periodic
+    # Robust binning: log-scale bins help wide distributions
+    # For very small/large deltas, keep it stable.
+    d = delta_sec
+    d = np.clip(d, 1e-3, 1e6)
+    logd = np.log10(d)
+    # 12 bins across observed range
+    bins = np.linspace(logd.min(), logd.max(), num=13)
+    hist, _ = np.histogram(logd, bins=bins)
+    peak_ratio = float(hist.max()) / float(len(d) + 1e-12)  # [0,1]
+
+    # (3) Support factor: need enough events
+    support = min(1.0, len(ts_dt) / 20.0)
+
+    # Combine
+    score = regularity * peak_ratio * support
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _weighted_hits(
+    src_nodes: np.ndarray,
+    dst_nodes: np.ndarray,
+    weights: np.ndarray,
+    num_nodes: int,
+    iters: int = 50,
+    eps: float = 1e-12,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Weighted HITS on directed edges src->dst.
+    Returns hub, authority vectors in R^num_nodes.
+
+    hub(u)  = sum_{u->v} w(u,v) * auth(v)
+    auth(v) = sum_{u->v} w(u,v) * hub(u)
+    """
+    hub = np.ones(num_nodes, dtype=np.float64)
+    auth = np.ones(num_nodes, dtype=np.float64)
+
+    w = weights.astype(np.float64)
+    w = np.clip(w, 0.0, np.percentile(w, 99.5) if len(w) > 1000 else w.max() + eps) + eps
+
+    for _ in range(int(iters)):
+        # hub update
+        hub_new = np.zeros_like(hub)
+        np.add.at(hub_new, src_nodes, w * auth[dst_nodes])
+
+        # auth update
+        auth_new = np.zeros_like(auth)
+        np.add.at(auth_new, dst_nodes, w * hub_new[src_nodes])
+
+        # normalize
+        hn = np.linalg.norm(hub_new) + eps
+        an = np.linalg.norm(auth_new) + eps
+        hub = hub_new / hn
+        auth = auth_new / an
+
+    return hub, auth
+
+
+@dataclass
+class InfraRankConfig:
+    # Core columns
+    src_col: str = "src_ip"
+    dst_col: str = "dst_ip"
+    score_col: str = "anomaly_score"
+    ts_col: str = "ts"
+
+    # Optional meta
+    dport_col: str = "dst_port"
+    proto_col: str = "proto"
+
+    # Ranking behavior
+    topn: int = 20
+    hits_iters: int = 50
+
+    # Filtering
+    min_score: float = 0.0          # keep edges with score > min_score
+    use_threshold: Optional[float] = None  # if set, use max(min_score, threshold)
+    max_edges_per_key: Optional[int] = 5000  # cap edges per target key (for huge datasets)
+
+    # Target key definition (for CDN/rotating IP mitigation)
+    key_mode: Literal["dst_ip", "signature"] = "dst_ip"
+    # signature means: dst_ip:dst_port:proto
+
+    # Infra focus
+    include_private_dst: bool = True
+    include_private_src: bool = True
+
+    # Beacon
+    beacon_min_events: int = 6
+
+    # Weighting (tunable)
+    w_authority: float = 1.0
+    w_unique_src: float = 0.9
+    w_active_days: float = 0.9
+    w_beacon: float = 0.8
+    w_anom: float = 0.5  # keep mild, since HITS already uses anomaly
+
+    # Anti-hub penalty (reduce common infra like DNS/proxy)
+    hub_penalty: float = 0.6  # stronger => penalize high indegree targets more
+
+
+def rank_infra(df_flows: pd.DataFrame, cfg: InfraRankConfig = InfraRankConfig()) -> pd.DataFrame:
+    """
+    Infer attacker-side infra candidates (C2/management/aggregation) using:
+
+    - Weighted HITS Authority (edge weights = anomaly_score)
+    - unique_src (fan-in diversity)
+    - active_days (persistence / re-appearance)
+    - collective beacon score (periodicity stability)
+    - mild anomaly aggregation
+
+    Returns a DataFrame with top infra candidates.
+    """
+    need_cols = [cfg.src_col, cfg.dst_col, cfg.score_col]
+    for c in need_cols:
+        if c not in df_flows.columns:
+            raise ValueError(f"rank_infra: missing required column: {c}")
+
+    df = df_flows.copy()
+
+    # sanitize
+    df[cfg.src_col] = df[cfg.src_col].astype(str)
+    df[cfg.dst_col] = df[cfg.dst_col].astype(str)
+    df[cfg.score_col] = pd.to_numeric(df[cfg.score_col], errors="coerce").fillna(0.0)
+
+    # filter private ip if desired
+    if not cfg.include_private_src:
+        df = df[~df[cfg.src_col].map(_is_private_ip)]
+    if not cfg.include_private_dst:
+        df = df[~df[cfg.dst_col].map(_is_private_ip)]
+
+    # score filter
+    thr = cfg.min_score
+    if cfg.use_threshold is not None:
+        thr = max(thr, float(cfg.use_threshold))
+    df = df[df[cfg.score_col] > float(thr)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "key", "dst_ip", "infra_score",
+            "authority", "unique_src", "active_days", "beacon_score",
+            "anom_topk_sum", "anom_mean", "anom_max",
+            "deg_in", "deg_out",
+        ])
+
+    # build key
+    if cfg.key_mode == "signature":
+        # safer even if missing meta columns
+        dport = df[cfg.dport_col].astype(str) if cfg.dport_col in df.columns else "NA"
+        proto = df[cfg.proto_col].astype(str) if cfg.proto_col in df.columns else "NA"
+        df["__key"] = df[cfg.dst_col] + ":" + dport + ":" + proto
+    else:
+        df["__key"] = df[cfg.dst_col]
+
+    # optional cap per key (avoid huge keys dominating)
+    if cfg.max_edges_per_key is not None and cfg.max_edges_per_key > 0:
+        k = int(cfg.max_edges_per_key)
+        # Keep top-k edges by anomaly within each key
+        df = df.sort_values(cfg.score_col, ascending=False)
+        df = df.groupby("__key", sort=False).head(k).copy()
+
+    # timestamp -> datetime (for active_days/beacon)
+    if cfg.ts_col in df.columns:
+        df["__dt"] = _to_datetime_safe(df[cfg.ts_col])
+        df["__day"] = df["__dt"].dt.floor("D")
+    else:
+        df["__dt"] = pd.NaT
+        df["__day"] = pd.NaT
+
+    # -------------------------
+    # Weighted HITS (Authority)
+    # Nodes are src_ip and key nodes in one namespace
+    # -------------------------
+    nodes = pd.Index(pd.unique(pd.concat([df[cfg.src_col], df["__key"]], ignore_index=True)))
+    nid = {n: i for i, n in enumerate(nodes)}
+
+    src_id = df[cfg.src_col].map(nid).to_numpy(dtype=np.int64)
+    dst_id = df["__key"].map(nid).to_numpy(dtype=np.int64)
+    w = df[cfg.score_col].to_numpy(dtype=np.float64)
+
+    hub, auth = _weighted_hits(
+        src_nodes=src_id,
+        dst_nodes=dst_id,
+        weights=w,
+        num_nodes=len(nodes),
+        iters=cfg.hits_iters,
+    )
+
+    # Extract authority for target keys only
+    key_index = df["__key"].drop_duplicates()
+    key_ids = key_index.map(nid).to_numpy(dtype=np.int64)
+    authority = pd.Series(auth[key_ids], index=key_index.to_numpy())
+
+    # degrees (in/out on the bipartite projection)
+    deg_in = pd.Series(0.0, index=key_index.to_numpy())
+    deg_out = pd.Series(0.0, index=key_index.to_numpy())
+    # indegree: count of edges into key
+    tmp_in = df.groupby("__key", sort=False)[cfg.src_col].size().astype(float)
+    deg_in.loc[tmp_in.index] = tmp_in
+    # outdegree: for src nodes, but we can report per key a proxy (same as deg_in) and skip deg_out
+    # For completeness: deg_out of key itself in this bipartite is 0. Keep as 0.
+    # If you later extend to key->key edges, you can populate it.
+
+    # -------------------------
+    # Aggregate features per key
+    # -------------------------
+    g = df.groupby("__key", sort=False)
+
+    unique_src = g[cfg.src_col].nunique().astype(float)
+
+    # persistence: number of active days (NaT-safe)
+    if df["__day"].notna().any():
+        active_days = g["__day"].nunique().astype(float)
+    else:
+        active_days = pd.Series(0.0, index=unique_src.index)
+
+    # anomaly aggregates
+    anom_mean = g[cfg.score_col].mean().astype(float)
+    anom_max = g[cfg.score_col].max().astype(float)
+
+    # Top-k sum (robust)
+    def _topk_sum(s: pd.Series, k: int = 10) -> float:
+        if s.empty:
+            return 0.0
+        return float(np.sum(np.sort(s.to_numpy())[-k:]))
+
+    anom_topk_sum = g[cfg.score_col].apply(_topk_sum).astype(float)
+
+    # beacon collective score
+    beacon_scores = {}
+    if df["__dt"].notna().any():
+        for key, sub in g:
+            ts_dt = sub["__dt"].dropna().to_numpy(dtype="datetime64[ns]")
+            beacon_scores[key] = _beacon_score_collective(ts_dt, min_events=cfg.beacon_min_events)
+    beacon_score = pd.Series(beacon_scores, dtype=float)
+    beacon_score = beacon_score.reindex(unique_src.index).fillna(0.0)
+
+    # -------------------------
+    # Combine into InfraScore
+    #   - normalize main axes
+    #   - penalty for common infra (high deg_in)
+    # -------------------------
+    auth_n = _normalize_01(authority.reindex(unique_src.index).fillna(0.0))
+    u_n = _normalize_01(np.log1p(unique_src))
+    d_n = _normalize_01(np.log1p(active_days))
+    b_n = beacon_score.clip(0.0, 1.0)  # already [0,1]
+    a_n = _normalize_01(np.log1p(anom_topk_sum))
+
+    # anti-hub penalty: higher indegree -> more likely generic infra (DNS/proxy)
+    hub_pen = 1.0 / (1.0 + np.log1p(deg_in.reindex(unique_src.index).fillna(0.0)))
+    hub_pen = hub_pen ** float(cfg.hub_penalty)
+
+    # score = product of components (with small floors)
+    score = (
+        (0.10 + cfg.w_authority * auth_n) *
+        (0.10 + cfg.w_unique_src * u_n) *
+        (0.10 + cfg.w_active_days * d_n) *
+        (0.05 + cfg.w_beacon * b_n) *
+        (0.20 + cfg.w_anom * a_n) *
+        hub_pen
+    )
+
+    out = pd.DataFrame({
+        "key": unique_src.index.astype(str),
+        "dst_ip": unique_src.index.astype(str),  # will be overwritten for signature mode
+        "infra_score": score.astype(float),
+        "authority": authority.reindex(unique_src.index).fillna(0.0).astype(float),
+        "unique_src": unique_src.astype(float),
+        "active_days": active_days.reindex(unique_src.index).fillna(0.0).astype(float),
+        "beacon_score": b_n.astype(float),
+        "anom_topk_sum": anom_topk_sum.astype(float),
+        "anom_mean": anom_mean.astype(float),
+        "anom_max": anom_max.astype(float),
+        "deg_in": deg_in.reindex(unique_src.index).fillna(0.0).astype(float),
+        "deg_out": deg_out.reindex(unique_src.index).fillna(0.0).astype(float),
+    })
+
+    if cfg.key_mode == "signature":
+        # key = "dst_ip:dst_port:proto"
+        # keep dst_ip only for display
+        out["dst_ip"] = out["key"].str.split(":", n=1).str[0]
+
+    out = out.sort_values("infra_score", ascending=False).head(int(cfg.topn)).reset_index(drop=True)
+    return out
